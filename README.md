@@ -1,1 +1,3 @@
-# Study_Project_2023
+# Study Project: Sensory augmentation and grasping movements
+
+This repository is the repository for the study project: Sensory augmentation and grasping movements in SS23 & WS23/24. It builds on the OptiVisT project in which we support blind people guiding their hand movements via a tactile bracelet and vibration motor inputs to the wrist. Here we further improve this idea by implementing a transformer neural network for hand movement guidance away from left, right, up, down commands from the bracelet to the user, to naturalistic movement vectors that are translated into corresponding direction vibrations on a better version of the tactile bracelet.
