@@ -1,0 +1,2 @@
+Name all videos with the lowercase class name and 2 digit counter per class, e.g.:
+targetobj02.mp4
