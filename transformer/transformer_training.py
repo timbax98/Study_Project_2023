@@ -4,10 +4,12 @@ import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 import absl.logging
 absl.logging.set_verbosity(absl.logging.ERROR)
+import matplotlib.pyplot as plt
 import numpy as np
 import shutil
 import tensorflow as tf
 import datetime
+
 import zipfile
 
 # endregion
@@ -74,53 +76,92 @@ def early_stopping(current_loss):
       return False
 
 
-def positional_encoding(max_seq_len, d_model):
-        pos = tf.cast(tf.range(max_seq_len)[:, tf.newaxis], tf.float32)
-        i = tf.range(d_model)[tf.newaxis, :]
-        angle_rates = tf.cast(1 / tf.pow(10000, (2 * (i // 2)) / d_model), tf.float32)
-        angle_rads = pos * angle_rates
+def positional_encoding(length, depth):
+    depth = depth/2
 
-        # Apply sine to even indices in the array; 2i
-        sines = tf.math.sin(angle_rads[:, 0::2])
-        # Apply cosine to odd indices in the array; 2i+1
-        cosines = tf.math.cos(angle_rads[:, 1::2])
+    positions = np.arange(length)[:, np.newaxis]     # (seq, 1)
+    depths = np.arange(depth)[np.newaxis, :]/depth   # (1, depth)
 
-        pos_encoding = tf.concat([sines, cosines], axis=-1)
-        pos_encoding = pos_encoding[tf.newaxis, ...] # add batch axis?
+    angle_rates = 1 / (10000**depths)         # (1, depth)
+    angle_rads = positions * angle_rates      # (pos, depth)
 
-        return tf.cast(pos_encoding, dtype=tf.float32)
+    pos_encoding = np.concatenate(
+        [np.sin(angle_rads), np.cos(angle_rads)],
+        axis=-1)
+    pos_encoding = tf.cast(pos_encoding, dtype=tf.float32)
+
+    return pos_encoding
 
 
-def normalize(inputs):
+def normalize(inputs, lower=0, upper=1):
     # normalize into range [-pi, pi]
     min_val = tf.reduce_min(inputs)
     max_val = tf.reduce_max(inputs)
-    normalized_inputs = tf.subtract(tf.divide(tf.subtract(inputs, min_val),
-                                              tf.subtract(max_val, min_val)), 0.5) * 2 * np.pi
-    return normalized_inputs
+    unit = tf.divide(tf.subtract(inputs, min_val), tf.subtract(max_val, min_val))
+
+    try:
+        if lower >= upper:
+            raise ValueError(f'Lower bound (current: {lower}) must be smaller than upper bound (current: {upper}).')
+        if lower != 0 and abs(lower) != abs(upper):
+            raise ValueError(f'Currently the method only supports unit normalization ([0,1]) or symmetric normalization ([-abs(upper),upper]).')
+
+        if lower == 0 and upper == 1: # unit-norm: scale to [0,1]
+            normalized_inputs = unit
+        elif lower == 0: # e.g. [0,5]
+            normalized_inputs = unit * upper
+        else: # scale to [-1, 1] * upper
+            normalized_inputs = tf.subtract(unit, 0.5) * 2 * upper
+        
+        return normalized_inputs
+    
+    except ValueError as e:
+        print("Error:", e)
 
 
-def sine_embedding(inputs, vocab_size, embedding_dim=8):
+def sine_embedding(inputs, d_model):
     # Initialize an empty list to store embeddings
     embeddings_list = []
+
+    # Generate embedding components for each dimension
+    for i in range(d_model // 2):
+        sine_embeddings = tf.sin((i + 1) * inputs)
+        cosine_embeddings = tf.cos((i + 1) * inputs)
     
-    # Calculate sine and cosine embeddings for each value in inputs
-    for value in range(vocab_size):
-        value_embedding = []
-        # Generate embedding components for each dimension
-        for i in range(embedding_dim // 2):
-            sine_embeddings = tf.sin((i + 1) * inputs)
-            cosine_embeddings = tf.cos((i + 1) * inputs)
-            value_embedding.extend([sine_embeddings, cosine_embeddings])
-        
-        # Stack embeddings for each dimension
-        value_embedding = tf.stack(value_embedding, axis=-1)
-        embeddings_list.append(value_embedding)
+        # Stack sine and cosine embeddings
+        embeddings = tf.stack([sine_embeddings, cosine_embeddings], axis=-1)
+        embeddings_list.append(embeddings)
     
-    # Concatenate embeddings along the last axis to create the final embedding
-    final_embedding = tf.stack(embeddings_list, axis=0)
+    # Concatenate embeddings along the last axis to create an 8D embedding
+    final_embedding = tf.concat(embeddings_list, axis=-1)
     
     return final_embedding
+
+
+def masked_loss(label, pred, pad_token=0):
+  mask = label != pad_token
+  loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
+    from_logits=True, reduction='none')
+  loss = loss_object(label, pred)
+
+  mask = tf.cast(mask, dtype=loss.dtype)
+  loss *= mask
+
+  loss = tf.reduce_sum(loss)/tf.reduce_sum(mask)
+  return loss
+
+
+def masked_accuracy(label, pred, pad_token=0):
+  pred = tf.argmax(pred, axis=2)
+  label = tf.cast(label, pred.dtype)
+  match = label == pred
+
+  mask = label != pad_token
+
+  match = match & mask
+
+  match = tf.cast(match, dtype=tf.float32)
+  mask = tf.cast(mask, dtype=tf.float32)
+  return tf.reduce_sum(match)/tf.reduce_sum(mask)
 
 # endregion
     
@@ -132,13 +173,19 @@ class PositionalEmbeddingContext(tf.keras.layers.Layer):
         super().__init__()
         self.d_model = d_model
         self.normalization = normalize # function reference
-        self.pos_encoding = positional_encoding(MAX_SEQ_LEN, d_model)
+        self.pos_encoding = positional_encoding(MAX_SEQ_LEN, depth=d_model)
 
     def call(self, inputs):
-        inputs = self.normalization(inputs)
+        seq_len = tf.shape(inputs)[1]
+        print(f'PosEmbedding Context (raw)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+        inputs = self.normalization(inputs, lower=-1, upper=1)
+        print(f'PosEmbedding Context (normalized)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
         # This factor sets the relative scale of the embedding and positonal_encoding.
         inputs *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-        inputs += self.pos_encoding[:, :tf.shape(inputs)[1], :]
+        print(f'PosEmbedding Context (scaled)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+        inputs += self.pos_encoding[tf.newaxis, :seq_len, :] # add batch axis, take pos encoding for positions up to sequence length and all embedding dimensions.
+        print(f'PosEncoding\n{self.pos_encoding.shape}, {self.pos_encoding.dtype}\n{self.pos_encoding}\n\n')
+        print(f'PosEmbedding Context (pos encoded)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
         return inputs
 
 
@@ -149,14 +196,22 @@ class PositionalEmbeddingInput(tf.keras.layers.Layer):
         self.d_model = d_model
         self.normalization = normalize # function reference
         self.embedding = sine_embedding
-        self.pos_encoding = positional_encoding(MAX_SEQ_LEN, d_model)
+        self.pos_encoding = positional_encoding(MAX_SEQ_LEN, depth=d_model)
 
     def call(self, inputs):
-        inputs = self.normalization(inputs)
-        inputs = self.embedding(inputs, self.input_vocab_size, self.d_model) # shape (batch_size, seq_len, 8)
+        seq_len = tf.shape(inputs)[1]
+        inputs = tf.squeeze(inputs, axis=-1) # strip last dimension
+        print(f'PosEmbeddingInput (raw)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+        inputs = self.normalization(inputs, lower=-np.pi, upper=np.pi)
+        print(f'PosEmbeddingInput (normalized)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+        inputs = self.embedding(inputs, self.d_model) # shape (batch_size, seq_len, 8)
+        print(f'PosEmbeddingInput (embedded)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
         # This factor sets the relative scale of the embedding and positonal_encoding.
         inputs *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-        inputs += self.pos_encoding[:, :tf.shape(inputs)[1], :]
+        print(f'PosEmbeddingInput (scaled)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+        inputs += self.pos_encoding[tf.newaxis, :seq_len, :]
+        print(f'PosEncoding\n{self.pos_encoding.shape}, {self.pos_encoding.dtype}\n{self.pos_encoding}\n\n')
+        print(f'PosEmbeddingInput (pos encoded)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
         return inputs
 
 
@@ -261,16 +316,19 @@ class Encoder(tf.keras.layers.Layer):
         self.dropout = tf.keras.layers.Dropout(dropout_rate)
 
     def call(self, x, training):
-        # `x` is token-IDs shape: (batch, seq_len)
-        x = self.pos_embedding(x)  # Shape `(batch_size, seq_len, d_model)`.
+
+        x = self.pos_embedding(x)  # shape (batch_size, seq_len, d_model)
+        embedded_x = x # comparison dummy
 
         # Add dropout.
         x = self.dropout(x, training=training)
+        print(f'Encoder Embedding == Dropout? {tf.reduce_all(tf.equal(embedded_x, x)).numpy()}\n')
 
         for i in range(self.num_layers):
             x = self.enc_layers[i](x)
 
-        return x  # Shape `(batch_size, seq_len, d_model)`.
+        print(f'Encoder Output\n{x.shape}, {x.dtype}\n{x[0]}\n\n')
+        return x  # shape (batch_size, seq_len, d_model)
 
 
 # Decoder
@@ -320,16 +378,19 @@ class Decoder(tf.keras.layers.Layer):
         self.last_attn_scores = None
 
     def call(self, x, context, training):
-        # `x` is token-IDs shape (batch, target_seq_len)
+        
         x = self.pos_embedding(x)  # (batch_size, target_seq_len, d_model)
+        embedded_x = x # comparison dummy
 
         x = self.dropout(x, training=training)
+        print(f'Decoder Embedding == Dropout? {tf.reduce_all(tf.equal(embedded_x, x)).numpy()}\n')
 
         for i in range(self.num_layers):
             x  = self.dec_layers[i](x, context)
 
         self.last_attn_scores = self.dec_layers[-1].last_attn_scores
-            
+        
+        print(f'Decoder Output\n{x.shape}, {x.dtype}\n{x[0]}\n\n')
         return x # (batch_size, target_seq_len, d_model)
 
 
@@ -349,27 +410,20 @@ class Transformer(tf.keras.Model):
         
         context, x = inputs
 
-        print(f"context shape is {context.shape}.")
-        print(f"x shape is {x.shape}.")
-
         context = self.encoder(context, training)
         x = self.decoder(x, context, training)
 
-        print(f"encoder output shape is {context.shape}.")
-        print(f"decoder output shape is {x.shape}.")
-
         logits = self.final_layer(x)
-        print(f"logits shape is {logits.shape}.")
 
         try:
             # Drop the keras mask, so it doesn't scale the losses/metrics.
             # b/250038731
             del logits._keras_mask
         except AttributeError:
-            print("Did not delete keras mask.")
+            #print("Did not delete keras mask.")
             pass
 
-        print(f"output shape is {logits.shape}.")
+        print(f'Transformer Output (logits)\n{logits.shape}, {logits.dtype}\n{logits[0]}\n\n')
         return logits
 
     #@tf.function
@@ -443,7 +497,7 @@ test_ds = dataset.skip(train_size).take(test_size)
 # Model HP
 num_layers = 4 # How often to stack encoder & decoder blocks
 d_model = 8 # Embedding Dimensionality (128) - might need to use 8 here, because our embedded input also only has 8 dims.
-dff = 512 # Dimensionality of the feed-forward sublayer
+dff = 32 # Dimensionality of the feed-forward sublayer (512)
 num_heads = 8 # Number of parallel self attention heads in the MHA layer
 dropout_rate = 0.1
 
@@ -457,6 +511,21 @@ print(f"\nNumber of batches: {num_batches}, Batch size: {batch_size}, Maximum se
 EPOCHS = 100
 PATIENCE = 100
 LEARNING_RATE = 0.001
+
+"""
+# Debugging: PosEncoding visualization
+pos_encoding = positional_encoding(length=MAX_SEQ_LEN, depth=d_model)
+
+# Check the shape.
+print(pos_encoding.shape)
+
+# Plot the dimensions.
+plt.pcolormesh(pos_encoding.numpy().T, cmap='RdBu')
+plt.ylabel('Depth')
+plt.xlabel('Position')
+plt.colorbar()
+plt.show()
+"""
 
 # Instantiate the Transformer model and print summary.
 transformer = Transformer(num_layers, d_model, num_heads, dff, input_vocab_size, dropout_rate)
