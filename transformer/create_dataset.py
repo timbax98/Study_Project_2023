@@ -8,14 +8,16 @@ import numpy as np
 import ultralytics
 import tensorflow as tf
 import yolov5
+import matplotlib.pyplot as plt
 
 # Configure Hyperparameters
-MAX_BATCH_SIZE = 32
-# alternative: use video resolution dependent epsilon; only care about width atm
-#EPSILON = vid_res[(batch+1)*(seq+1)][1] / 12
-EPSILON = 100 # what is a good range?
-MAX_MISSING = 10 # 999999999 placeholder to remove no videos
-MIN_DETECTS = 1/4
+MAX_BATCH_SIZE = 32 # maximum batch size of transformer training dataset
+EPSILON = 100 # pixel threshold for tokenizing the successful overlap of hand and target (EOS); which range?
+#EPSILON = vid_res[(batch+1)*(seq+1)][1] / 12  # alternative: use video resolution dependent epsilon
+MAX_MISSING = 10 # maximum length of missing detection sequence in a video, otherwise removed
+MIN_DETECTS = 1/4 # minimum number of frames in which object is detected, otherwise removed
+MIN_SCORE = 0.55 # minimum score threshold for evaluating true hand candidates in a video with multiple hand detections
+TRACKING_AREA = 100 # maximum distance for detecting hands after a true hand is lost; which range?
 
 # Create path variables
 folderpath = './data/trials/'
@@ -50,9 +52,11 @@ def GetBoundingBoxes(videopath, weightpath):
     # Get the frames per second (fps) and frame count
     fps = cap.get(cv2.CAP_PROP_FPS)
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frameHeight = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    true_hand_found = False
 
     # Loop through each frame and detection
-    for frame_num in range(frame_count):  #range(frame_count)
+    for frame_num in range(frame_count):
         ret, frame = cap.read()
 
         if not ret:
@@ -80,28 +84,38 @@ def GetBoundingBoxes(videopath, weightpath):
         # Filtering: Multiple hand detections per frame
         # do this only for hands, as only one hand should be detected (not using class filtering)
         if weightpath == weights_hands:
+            
+            # Get all hand detections in this frame
+            detections = result.xywh[0].cpu().numpy()
 
-            # handle first frame (no previous detection)
-            if frame_num == 0:
-                last_detection = np.full((1, 7), np.nan)
-                if n > 1:
-                    # assumption: hand moves into the frame from the bottom
-                    data = data[np.argmax(data[:,3])].reshape((1, 7)) # not taken as last_detection!
+            # if there are any detections
+            if len(detections) != 0:
+                # if the "ground truth" hand has not been found yet
+                if not true_hand_found:
 
-            # if multiple detections per frame, take the one closest to last frame's BB
-            if n > 1 and not np.isnan(last_detection).any():
-                distances = np.linalg.norm(data[:, 2:4] - last_detection[:, 2:4], axis=1)
-                closest_index = np.argmin(np.abs(distances))
-                data = data[closest_index].reshape((1, 7))
+                    max_score = 0 # within one frame
+                    for _, d in enumerate(detections):
+                        _, ycenter, _, bbheight, conf, _ = d
+                        vidheight = frameHeight
+                        # evaluation of true_hand candidate detections
+                        score = conf * ((ycenter - (bbheight//2)) / vidheight)
 
-            # update the last detection if there was any
-            if len(data) > 0:
-                # If initially multiple detections occur in a later frame, this has to be reduced to 1D
-                if len(data) > 1: # we can take len() because it is 2D
-                    mean = np.mean(data[:, 2:6], axis=0)
-                    data = data[0].reshape((1, 7))
-                    data[:, 2:6] = mean
-                last_detection = data
+                        # search for true hand using the eval score (confidence weighted y-pos)
+                        if score >= MIN_SCORE and score > max_score:
+                            detection = d[0:4].reshape((1,4))
+                            data = np.concatenate((np.array([[frame_num, 333]]), detection, np.array([[0]])), axis=1)
+                            last_detection = detection
+                            max_score = score
+                            true_hand_found = True
+                else:
+                    distances = np.linalg.norm(detections[:, :4] - last_detection, axis=1)
+
+                    # tracking area avoids jumps to a wrong hand if the true hand is lost in a frame
+                    if min(np.abs(distances)) <= TRACKING_AREA:
+                        closest_index = np.argmin(np.abs(distances))
+                        detection = detections[closest_index, :4].reshape((1, 4))
+                        data = np.concatenate((np.array([[frame_num, 333]]), detection, np.array([[0]])), axis=1)
+                        last_detection = detection
         
         bbs = np.concatenate((bbs, data), axis=0)
 
@@ -111,14 +125,13 @@ def GetBoundingBoxes(videopath, weightpath):
     return bbs , classes, remove_vid
 
 
-def Center(videopath, labelpath, bounding_boxes):
+def Center(videopath, bounding_boxes):
 
     """
     Create a video where a target object is always centered.
 
     Args:
     videopath -- path to video to center
-    labelpath -- location to export centered video to
     bounding_boxes -- bbs of object to center on
     width -- output video dim x, default=1920
     height -- output video dim y, default=1120
@@ -157,23 +170,21 @@ def Center(videopath, labelpath, bounding_boxes):
             y_dists.append(0)
         else:
             # get center of bb
-            #center_x_bb = (box_pos[0] + box_pos[2]) / 2
-            #center_y_bb = (box_pos[1] + box_pos[3]) / 2
             center_x_bb = box_pos[0]
             center_y_bb = box_pos[1]
             # calculate distances
             x_dists.append(abs(center_x-center_x_bb))
             y_dists.append(abs(center_y-center_y_bb))
 
-    video_corrected = np.zeros((len(video),
+    # 3. Center video
+    video_centered = np.zeros((len(video),
                               int(height + max(y_dists)*2),
                               int(width + max(x_dists)*2),
                               3), dtype=int)
 
-    # 3. Center video
-    # get coords for placement height and width. may be switched
-    start_row = (video_corrected.shape[1] - height) // 2
-    start_col = (video_corrected.shape[2] - width) // 2
+    # get coords for placement height and width
+    start_row = (video_centered.shape[1] - height) // 2
+    start_col = (video_centered.shape[2] - width) // 2
 
     offsets = np.zeros(shape=(len(bbs),2))
 
@@ -210,27 +221,83 @@ def Center(videopath, labelpath, bounding_boxes):
             fixed_end_col = fixed_start_col + width
 
             # Save centered + corrected in new video
-            video_corrected[idx][fixed_start_row:fixed_end_row,
+            video_centered[idx][fixed_start_row:fixed_end_row,
                               fixed_start_col:fixed_end_col] = frame
 
             #Save offsets
             offsets[idx,:] = x_offset, y_offset
 
-    # 4. Save video (Debug)
-    """
-    video_corrected = np.uint8(video_corrected)
 
-    height_new = int(video_corrected.shape[1])
-    width_new = int(video_corrected.shape[2])
+    return offsets, (start_row, start_col), video_centered
+
+
+def Export(video, targetBBs, handBBs, labelpath):
+
+    video_centered = np.uint8(video)
+    video_centered = video_centered[:len(targetBBs), :, :, :]
+
+    height_new = int(video_centered.shape[1])
+    width_new = int(video_centered.shape[2])
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(labelpath[:-4]+'_centered.mp4', fourcc, FPS, (width_new, height_new), True)
-    for idx in range(len(video)):
-        out.write(video_corrected[idx])
-    out.release()
-    """
+    out = cv2.VideoWriter(labelpath[:-4]+'_centered.mp4', fourcc, 30, (width_new, height_new), True)
 
-    return offsets, (start_row, start_col)
+    for i, frame in enumerate(video_centered):
+
+        # Draw Bounding Boxes for target and hand
+        if targetBBs[i,1] == i:
+            if not np.isnan(targetBBs[i]).any():
+                xc = int(targetBBs[i, 2])
+                yc = int(targetBBs[i, 3])
+                width = int(targetBBs[i, 4])
+                height = int(targetBBs[i, 5])
+                cv2.rectangle(frame, (xc - width//2, yc - height//2), (xc + width//2, yc + height//2), (0, 255, 0), 2)
+
+            if not np.isnan(handBBs[i]).any():
+                xc = int(handBBs[i, 0])
+                yc = int(handBBs[i, 1])
+                width = int(handBBs[i, 2])
+                height = int(handBBs[i, 3])
+                cv2.rectangle(frame, (xc - width//2, yc - height//2), (xc + width//2, yc + height//2), (0, 0, 255), 2)
+
+        # Calculate Angle
+                
+        # If not at the end of the video
+        if i < len(handBBs) - 1:
+                
+            # If current and next frame have a detection
+            if not np.isnan(handBBs[i]).any() and not np.isnan(handBBs[i + 1]).any():
+
+                # Get hand BBox center of the current frame
+                xc_current = handBBs[i, 0] 
+                yc_current = handBBs[i, 1]
+
+                # Get hand BBox center of the next frame
+                xc_next = handBBs[i + 1, 0]
+                yc_next = handBBs[i + 1, 1]
+                
+                # Calculate the angle between the line passing through the centers of the hand bounding boxes and the positive x-axis
+                angle = np.arctan2(yc_next-yc_current,xc_next-xc_current)
+
+                # Calculate vector components based on angle
+                magnitude = 600  # Adjust the magnitude of the vectors as needed
+                dx = int(magnitude * np.cos(angle))
+                dy = int(magnitude * np.sin(angle))
+
+                #print(yc_next, yc_current, xc_next, xc_current)
+                #print(f"angle: {angle}")
+
+                # Draw the vector on the frame
+                cv2.arrowedLine(frame, (int(xc_current), int(yc_current)), (int(xc_current + dx), int(yc_current + dy)), (255, 0, 0), 2)
+                
+                # Draw the angle in radians and degrees on the frame
+                cv2.putText(frame, f"{angle:.2f}", (int(xc_current + dx), int(yc_current + dy)), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+                cv2.putText(frame, f"{np.degrees(angle):.2f}", (int(xc_current + dx), int(yc_current + dy + 30)), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+
+            
+
+        out.write(frame)
+    out.release()
 
 
 def check_overlap(bbox1, bbox2):
@@ -309,6 +376,79 @@ def calculate_batch_size(num_inputs, max_batch_size=128):
         if num_inputs % batch_size == 0:
             return batch_size
 
+
+def PlotTrajectory(path, name, input):
+
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+    video_data = input
+
+    # Plotting centers of hand and object bounding boxes
+    object_centers = video_data[:, [2, 3]]  # x and y centers of the object
+    object_widths = video_data[:, 4]
+    object_heights = video_data[:, 5]
+
+    hand_centers = video_data[:, [6, 7]]  # x and y centers of the hand
+    hand_widths = video_data[:, 8]
+    hand_heights = video_data[:, 9]
+
+    video_width = 1920
+    video_height = 1080
+
+    # Use the first object center as a reference for the plot's center
+    ref_ox, ref_oy = object_centers[0]
+
+    #print(f"\n Printing object centers for video with index {video_index} ({len(object_centers)} frames). Should all be the same. \n {object_centers} \n \n")
+
+    plt.figure(figsize=(10, 6))
+    # For every frame in the current video, plot the boundingboxes
+    for frame in range(len(video_data)):
+        ox, oy = object_centers[frame]
+        ow = object_widths[frame]
+        oh = object_heights[frame]
+
+        hx, hy = hand_centers[frame]
+        hw = hand_widths[frame]
+        hh = hand_heights[frame]
+
+        # Plot the bounding box for the object
+        plt.plot([ox - ow / 2, ox + ow / 2, ox + ow / 2, ox - ow / 2, ox - ow / 2],
+                 [oy - oh / 2, oy - oh / 2, oy + oh / 2, oy + oh / 2, oy - oh / 2],
+                 'b-')  # Object bounding box in blue
+
+        # Plot the bounding box for the hand
+        plt.plot([hx - hw / 2, hx + hw / 2, hx + hw / 2, hx - hw / 2, hx - hw / 2],
+                 [hy - hh / 2, hy - hh / 2, hy + hh / 2, hy + hh / 2, hy - hh / 2],
+                 'r-')  # Hand bounding box in red
+
+        # Plot the actual video size in the centered(padded) video
+        plt.plot([ref_ox - video_width / 2, ref_ox + video_width / 2, ref_ox + video_width / 2, ref_ox - video_width / 2, ref_ox - video_width / 2],
+                 [ref_oy - video_height / 2, ref_oy - video_height / 2, ref_oy + video_height / 2, ref_oy + video_height / 2, ref_oy - video_height / 2],
+                 'g-')  # actual video in green
+
+        plt.plot(ox, oy, 'bo')  # Object center in blue
+        plt.plot(hx, hy, 'ro')  # Hand center in red
+
+
+    plt.title(f"Object and Hand Centers for Video {name}")
+    plt.xlabel("X-coordinate")
+    plt.ylabel("Y-coordinate")
+    plt.legend(["Object Center", "Hand Center"])
+
+    # Set the plot limits to keep the object center in the middle of the plot
+    plt.xlim(0, ref_ox*2)
+    plt.ylim(0, ref_oy*2)
+
+    # Ensure the object center is visually marked at the center
+    plt.scatter(ref_ox, ref_oy, c='blue', marker='x', s=100, label='Fixed Object Center')
+
+    # Flip Y-axis and save the plot to a file
+    plt.gca().invert_yaxis()
+    plt.savefig(path+video[:-4]+".png")
+    plt.close()  # Close the plot to free up memory
+
+
 # endregion
 
 # region Input
@@ -333,16 +473,14 @@ videos_removed = 0 # counter for videos that were removed due to not meeting our
 # Iterate through every video file in the folder
 for i, video in enumerate(folder):
 
-    ### 0. Setup ###
-
-    print(f"\n Video {i+1}/{len(folder)}: {video}")
+    ### 0. Setup ###    
 
     # Get length of input array (number of frames)
     cap = cv2.VideoCapture(folderpath+video)
     frameCount = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
 
-    print(f"Initial total frame count: {frameCount} \n")
+    print(f"\n Video {i+1}/{len(folder)}: {video} ({frameCount} frames) \n")
 
 
     ### 1. Get all bbs of this video ###
@@ -359,7 +497,6 @@ for i, video in enumerate(folder):
         continue
 
     # Get bbs from hands model
-    #print("Hand BBs")
     bbs_hands, classes_hands, remove_vid = GetBoundingBoxes(folderpath+video, weights_hands)
     video_count = np.repeat(i, len(bbs_hands)).reshape((len(bbs_hands),1))
     bbs_hands = np.concatenate((video_count, bbs_hands), axis=1)
@@ -374,7 +511,7 @@ for i, video in enumerate(folder):
     ### 2. Filter for target by class name ###
 
     if ('.mov' in video) or ('.mp4' in video):
-        # returns the string name without '00_centered.mp4' ending
+        # returns the string name without '000.mp4' ending
         target_class = video[:-7]
 
     # Get class number from lookup table
@@ -385,8 +522,8 @@ for i, video in enumerate(folder):
 
     target_bbs = bbs_objects[(bbs_objects[:, 2] == target_class)]
     target_bbs = target_bbs[:, [0,1,3,4,5,6]]
-    #hand_bbs = bbs_hands[(bbs_hands[:, 2] == hand_class)]
-    hand_bbs = bbs_hands[:, [0,1,3,4,5,6]] # hand_bbs[:, [0,1,3,4,5,6]]
+    hand_bbs = bbs_hands[(bbs_hands[:, 2] == 333)] # true hand evaluator class ID
+    hand_bbs = hand_bbs[:, [0,1,3,4,5,6]]
 
     # Cut frames after overlap of hand and target
     hand_bbs, target_bbs, frameCount = delete_overlap_rows(hand_bbs, target_bbs, frameCount)
@@ -414,7 +551,7 @@ for i, video in enumerate(folder):
 
     if len(x_detects_target) < possible_detections * MIN_DETECTS or any(diff > MAX_MISSING for diff in differences):
         print("Video skipped because there are not enough detections or missing frame sequences are too long (objects).")
-        print(f"x_detects_target: {len(x_detects_target)}, possible detections: {possible_detections}, threshold: {possible_detections * MIN_DETECTS}")
+        #print(f"x_detects_target: {len(x_detects_target)}, possible detections: {possible_detections}, threshold: {possible_detections * MIN_DETECTS}")
         videos_removed += 1
         continue
 
@@ -475,7 +612,7 @@ for i, video in enumerate(folder):
 
     if len(x_detects_hand) < possible_detections * MIN_DETECTS or any(diff > MAX_MISSING for diff in differences):
         print("Video skipped because there are not enough detections or missing frame sequences are too long (hands).")
-        print(f"x_detects_target: {len(x_detects_hand)}, possible detections: {possible_detections}, threshold: {possible_detections * MIN_DETECTS}")
+        #print(f"x_detects_target: {len(x_detects_hand)}, possible detections: {possible_detections}, threshold: {possible_detections * MIN_DETECTS}")
         videos_removed += 1
         continue
 
@@ -521,7 +658,7 @@ for i, video in enumerate(folder):
 
 
     ### 4. Center: Center on the correct bounding boxes of the target object ###
-    offsets, start_cords = Center(folderpath+video, labelpath+video, vid_input[:, 2:6])
+    offsets, start_cords, video_centered = Center(folderpath+video, vid_input[:, 2:6])
 
     new_target_bbs = vid_input[:,:6]
     new_hand_bbs = vid_input[:,6:]
@@ -551,6 +688,9 @@ for i, video in enumerate(folder):
     new_target_bbs[:,3] -= y_offsets
     new_hand_bbs[:,1] -= y_offsets
 
+    ### Debug: Export centered videos with BBs
+    Export(video_centered, new_target_bbs, new_hand_bbs, labelpath+video)
+
 
     ### 5. Input concatenation ###
 
@@ -558,18 +698,21 @@ for i, video in enumerate(folder):
     bbs = bbs[~np.isnan(bbs).any(axis=1)] # remove frames without detections
     input = np.concatenate((input, bbs), axis=0)
 
+    ### Debug: Plot grasping trajectory
+    PlotTrajectory("./data/trajectories/", video, bbs)
 
-print("\n Input created.")
-print(f"Number of videos (total): {len(folder)}, Removed: {videos_removed}, Left: {len(folder)-videos_removed}")
+print(f"\n INPUT CREATED \n Number of videos (total): {len(folder)}, Removed: {videos_removed}, Left: {len(folder)-videos_removed}")
 
 # Debugging: check input
+"""
 with np.printoptions(threshold=sys.maxsize, suppress=True):
     print("\n \n Printing the first 200 input rows.")
     print(input[:200])
+"""
 
 # endregion
 
-# region Tokenization
+# region Markers
 
 # define tokens; has to be unusual in sequences (0 to max dim of video res) as well as labels (radiands: -2pi to 2pi)
 start_token = -333 # for seqs and labels
@@ -662,7 +805,11 @@ for batch in padded_seq_batches:
                 continue
 
             # else neither start- nor end-token -> calculate angle
-            lbl[row] = np.arctan2(seq[row,7] - seq[row+1,7], seq[row,6] - seq[row+1,6]) # angle between current and next frame
+            # Calculate the angle between the line passing through the centers of two subsequent hand bounding boxes and the positive x-axis
+            lbl[row] = np.arctan2(seq[row+1,5] - seq[row,5], seq[row+1,4] - seq[row,4]) 
+
+            #print(seq[row+1,5], seq[row,5],seq[row+1,4], seq[row+1,4])
+            #print(f"label_angle: {np.arctan2(seq[row+1,5] - seq[row,5], seq[row+1,4] - seq[row,4])}")
 
         labels.append(lbl)
 
@@ -698,6 +845,7 @@ Y = tf.data.Dataset.from_generator(lbl_generator, output_signature=tf.TensorSpec
 train_ds = tf.data.Dataset.zip((X, Y))
 
 # Debugging: check train dataset
+"""
 samples_to_print = 1
 print("\n \n Printing {} train_ds".format(samples_to_print))
 for i, (train_data, label_data) in enumerate(train_ds.take(samples_to_print)):
@@ -711,6 +859,7 @@ for i, (train_data, label_data) in enumerate(train_ds.take(samples_to_print)):
         print(label_data.shape)
         print(label_data.numpy())
         print()
+"""
 
 
 # 2. Export dataset
