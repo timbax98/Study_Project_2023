@@ -76,6 +76,10 @@ def early_stopping(current_loss):
       return False
 
 
+def compute_mask(inputs, padding_token=0):
+    return tf.cast(tf.not_equal(inputs, padding_token), tf.float32)
+
+
 def positional_encoding(length, depth):
     depth = depth/2
 
@@ -93,75 +97,66 @@ def positional_encoding(length, depth):
     return pos_encoding
 
 
-def normalize(inputs, lower=0, upper=1):
-    # normalize into range [-pi, pi]
-    min_val = tf.reduce_min(inputs)
-    max_val = tf.reduce_max(inputs)
-    unit = tf.divide(tf.subtract(inputs, min_val), tf.subtract(max_val, min_val))
+def normalize(inputs, lower_bound=0, upper_bound=1, min_val=None, max_val=None):
+    # If min_val and max_val are not provided, compute them from the inputs
+    if min_val is None:
+        min_val = tf.reduce_min(inputs)
+    if max_val is None:
+        max_val = tf.reduce_max(inputs)
 
     try:
-        if lower >= upper:
-            raise ValueError(f'Lower bound (current: {lower}) must be smaller than upper bound (current: {upper}).')
-        if lower != 0 and abs(lower) != abs(upper):
-            raise ValueError(f'Currently the method only supports unit normalization ([0,1]) or symmetric normalization ([-abs(upper),upper]).')
+        if lower_bound >= upper_bound:
+            raise ValueError(f'Lower bound (current: {lower_bound}) must be smaller than upper bound (current: {upper_bound}).')
 
-        if lower == 0 and upper == 1: # unit-norm: scale to [0,1]
-            normalized_inputs = unit
-        elif lower == 0: # e.g. [0,5]
-            normalized_inputs = unit * upper
-        else: # scale to [-1, 1] * upper
-            normalized_inputs = tf.subtract(unit, 0.5) * 2 * upper
-        
-        return normalized_inputs
-    
+        # Scale inputs to the custom range [lower_bound, upper_bound]
+        scaled_inputs = lower_bound + (inputs - min_val) * (upper_bound - lower_bound) / (max_val - min_val)
+
+        return scaled_inputs
+
     except ValueError as e:
         print("Error:", e)
 
 
 def sine_embedding(inputs, d_model):
-    # Initialize an empty list to store embeddings
-    embeddings_list = []
-
-    # Generate embedding components for each dimension
-    for i in range(d_model // 2):
-        sine_embeddings = tf.sin((i + 1) * inputs)
-        cosine_embeddings = tf.cos((i + 1) * inputs)
+    # Apply sine and cosine transformations to each value
+    sine_embeddings = tf.sin(inputs)
+    cosine_embeddings = tf.cos(inputs)
     
-        # Stack sine and cosine embeddings
-        embeddings = tf.stack([sine_embeddings, cosine_embeddings], axis=-1)
-        embeddings_list.append(embeddings)
+    # Stack sine and cosine embeddings together into ([sin,cos,sin,cos,sin,cos,sin,cos])
+    alternating_embeddings = tf.stack([sine_embeddings, cosine_embeddings] * (d_model//2), axis=-1)
     
-    # Concatenate embeddings along the last axis to create an 8D embedding
-    final_embedding = tf.concat(embeddings_list, axis=-1)
+    # Stack sine and cosine embeddings together into ([sin,sin,sin,sin,cos,cos,cos,cos])
+    repeated_embeddings = tf.stack([sine_embeddings, cosine_embeddings], axis=-1)
+    repeated_embeddings = tf.repeat(repeated_embeddings, repeats=d_model//2, axis=-1)
     
-    return final_embedding
+    return alternating_embeddings
 
 
-def masked_loss(label, pred, pad_token=0):
-  mask = label != pad_token
-  loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
+def masked_loss(label, pred, pad_token=-2):
+    mask = label != pad_token
+    loss_object = tf.keras.losses.SparseCategoricalCrossentropy(
     from_logits=True, reduction='none')
-  loss = loss_object(label, pred)
+    loss = loss_object(label, pred)
 
-  mask = tf.cast(mask, dtype=loss.dtype)
-  loss *= mask
+    mask = tf.cast(mask, dtype=loss.dtype)
+    loss *= mask
 
-  loss = tf.reduce_sum(loss)/tf.reduce_sum(mask)
-  return loss
+    loss = tf.reduce_sum(loss)/tf.reduce_sum(mask)
+    return loss
 
 
-def masked_accuracy(label, pred, pad_token=0):
-  pred = tf.argmax(pred, axis=2)
-  label = tf.cast(label, pred.dtype)
-  match = label == pred
+def masked_accuracy(label, pred, pad_token=-2):
+    pred = tf.argmax(pred, axis=2)
+    label = tf.cast(label, pred.dtype)
+    match = label == pred
 
-  mask = label != pad_token
+    mask = label != pad_token
 
-  match = match & mask
+    match = match & mask
 
-  match = tf.cast(match, dtype=tf.float32)
-  mask = tf.cast(mask, dtype=tf.float32)
-  return tf.reduce_sum(match)/tf.reduce_sum(mask)
+    match = tf.cast(match, dtype=tf.float32)
+    mask = tf.cast(mask, dtype=tf.float32)
+    return tf.reduce_sum(match)/tf.reduce_sum(mask)
 
 # endregion
     
@@ -176,16 +171,21 @@ class PositionalEmbeddingContext(tf.keras.layers.Layer):
         self.pos_encoding = positional_encoding(MAX_SEQ_LEN, depth=d_model)
 
     def call(self, inputs):
+
         seq_len = tf.shape(inputs)[1]
-        print(f'PosEmbedding Context (raw)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
-        inputs = self.normalization(inputs, lower=-1, upper=1)
-        print(f'PosEmbedding Context (normalized)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+        #print(f'PosEmbedding Context (raw)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+
+        inputs = self.normalization(inputs, lower_bound=-1, upper_bound=1, min_val=0, max_val=1920)
+        #print(f'PosEmbedding Context (normalized)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+
         # This factor sets the relative scale of the embedding and positonal_encoding.
         inputs *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-        print(f'PosEmbedding Context (scaled)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+        #print(f'PosEmbedding Context (scaled)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+
         inputs += self.pos_encoding[tf.newaxis, :seq_len, :] # add batch axis, take pos encoding for positions up to sequence length and all embedding dimensions.
-        print(f'PosEncoding\n{self.pos_encoding.shape}, {self.pos_encoding.dtype}\n{self.pos_encoding}\n\n')
-        print(f'PosEmbedding Context (pos encoded)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+        #print(f'PosEncoding\n{self.pos_encoding.shape}, {self.pos_encoding.dtype}\n{self.pos_encoding}\n\n')
+        #print(f'PosEmbedding Context (pos encoded)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+
         return inputs
 
 
@@ -199,19 +199,28 @@ class PositionalEmbeddingInput(tf.keras.layers.Layer):
         self.pos_encoding = positional_encoding(MAX_SEQ_LEN, depth=d_model)
 
     def call(self, inputs):
+
         seq_len = tf.shape(inputs)[1]
         inputs = tf.squeeze(inputs, axis=-1) # strip last dimension
-        print(f'PosEmbeddingInput (raw)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
-        inputs = self.normalization(inputs, lower=-np.pi, upper=np.pi)
-        print(f'PosEmbeddingInput (normalized)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+        #print(f'PosEmbeddingInput (raw)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+
+        inputs = self.normalization(inputs, lower_bound=-np.pi, upper_bound=np.pi, min_val=0, max_val=360)
+        #print(f'PosEmbeddingInput (normalized)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+
         inputs = self.embedding(inputs, self.d_model) # shape (batch_size, seq_len, 8)
-        print(f'PosEmbeddingInput (embedded)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+        # Manual embedding of input SOS token (first row of embedding in each video in the batch is set to 4x (0,0), as this is mid of circle)
+        mask = tf.concat([tf.zeros_like(inputs[:, :1, :]), tf.ones_like(inputs[:, 1:, :])], axis=1)
+        inputs *= mask
+        #print(f'PosEmbeddingInput (embedded)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+
         # This factor sets the relative scale of the embedding and positonal_encoding.
         inputs *= tf.math.sqrt(tf.cast(self.d_model, tf.float32))
-        print(f'PosEmbeddingInput (scaled)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+        #print(f'PosEmbeddingInput (scaled)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+
         inputs += self.pos_encoding[tf.newaxis, :seq_len, :]
-        print(f'PosEncoding\n{self.pos_encoding.shape}, {self.pos_encoding.dtype}\n{self.pos_encoding}\n\n')
-        print(f'PosEmbeddingInput (pos encoded)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+        #print(f'PosEncoding\n{self.pos_encoding.shape}, {self.pos_encoding.dtype}\n{self.pos_encoding}\n\n')
+        #print(f'PosEmbeddingInput (pos encoded)\n{inputs.shape}, {inputs.dtype}\n{inputs[0]}\n\n')
+
         return inputs
 
 
@@ -239,22 +248,24 @@ class CrossAttention(BaseAttention):
 
 
 class GlobalSelfAttention(BaseAttention):
-    def call(self, x):
+    def call(self, x, mask):
         attn_output = self.mha(
             query=x,
             value=x,
-            key=x)
+            key=x,
+            attention_mask=mask) # Mask padding tokens from Encoder input
         x = self.add([x, attn_output])
         x = self.layernorm(x)
         return x
 
 
 class CausalSelfAttention(BaseAttention):
-    def call(self, x):
+    def call(self, x, mask):
         attn_output = self.mha(
             query=x,
             value=x,
             key=x,
+            attention_mask=mask, # Mask padding tokens from Decoder input
             use_causal_mask = True)
         x = self.add([x, attn_output])
         x = self.layernorm(x)
@@ -291,8 +302,8 @@ class EncoderLayer(tf.keras.layers.Layer):
 
         self.ffn = FeedForward(d_model, dff)
 
-    def call(self, x):
-        x = self.self_attention(x)
+    def call(self, x, mask):
+        x = self.self_attention(x, mask)
         x = self.ffn(x)
         return x
 
@@ -315,19 +326,18 @@ class Encoder(tf.keras.layers.Layer):
             for _ in range(num_layers)]
         self.dropout = tf.keras.layers.Dropout(dropout_rate)
 
-    def call(self, x, training):
+    def call(self, x, training, mask):
 
         x = self.pos_embedding(x)  # shape (batch_size, seq_len, d_model)
         embedded_x = x # comparison dummy
 
         # Add dropout.
         x = self.dropout(x, training=training)
-        print(f'Encoder Embedding == Dropout? {tf.reduce_all(tf.equal(embedded_x, x)).numpy()}\n')
 
         for i in range(self.num_layers):
-            x = self.enc_layers[i](x)
+            x = self.enc_layers[i](x, mask)
 
-        print(f'Encoder Output\n{x.shape}, {x.dtype}\n{x[0]}\n\n')
+        #print(f'Encoder Output\n{x.shape}, {x.dtype}\n{x[0]}\n\n')
         return x  # shape (batch_size, seq_len, d_model)
 
 
@@ -348,14 +358,14 @@ class DecoderLayer(tf.keras.layers.Layer):
 
         self.ffn = FeedForward(d_model, dff)
 
-    def call(self, x, context):
-        x = self.causal_self_attention(x=x)
+    def call(self, x, context, mask):
+        x = self.causal_self_attention(x=x, mask=mask)
         x = self.cross_attention(x=x, context=context)
 
         # Cache the last attention scores for plotting later
         self.last_attn_scores = self.cross_attention.last_attn_scores
 
-        x = self.ffn(x)  # Shape `(batch_size, seq_len, d_model)`.
+        x = self.ffn(x) # shape (batch_size, seq_len, d_model)
 
         return x
     
@@ -377,20 +387,20 @@ class Decoder(tf.keras.layers.Layer):
 
         self.last_attn_scores = None
 
-    def call(self, x, context, training):
+    def call(self, x, context, training, mask):
         
         x = self.pos_embedding(x)  # (batch_size, target_seq_len, d_model)
         embedded_x = x # comparison dummy
 
         x = self.dropout(x, training=training)
-        print(f'Decoder Embedding == Dropout? {tf.reduce_all(tf.equal(embedded_x, x)).numpy()}\n')
 
         for i in range(self.num_layers):
-            x  = self.dec_layers[i](x, context)
+            x  = self.dec_layers[i](x, context, mask)
 
+        # Cache the last attention scores for plotting later
         self.last_attn_scores = self.dec_layers[-1].last_attn_scores
         
-        print(f'Decoder Output\n{x.shape}, {x.dtype}\n{x[0]}\n\n')
+        #print(f'Decoder Output\n{x.shape}, {x.dtype}\n{x[0]}\n\n')
         return x # (batch_size, target_seq_len, d_model)
 
 
@@ -406,12 +416,12 @@ class Transformer(tf.keras.Model):
         self.loss_function = tf.keras.losses.MeanSquaredError()
         self.optimizer = tf.keras.optimizers.Adam()
 
-    def call(self, inputs, training):
+    def call(self, inputs, mask=None, training=False):
         
         context, x = inputs
 
-        context = self.encoder(context, training)
-        x = self.decoder(x, context, training)
+        context = self.encoder(context, training, mask)
+        x = self.decoder(x, context, training, mask)
 
         logits = self.final_layer(x)
 
@@ -423,14 +433,16 @@ class Transformer(tf.keras.Model):
             #print("Did not delete keras mask.")
             pass
 
-        print(f'Transformer Output (logits)\n{logits.shape}, {logits.dtype}\n{logits[0]}\n\n')
+        #print(f'Transformer Output (logits)\n{logits.shape}, {logits.dtype}\n{logits[0]}\n\n')
         return logits
 
     #@tf.function
-    def train_step(self, inputs, targets):
+    def train_step(self, inputs, targets, mask):
 
         with tf.GradientTape() as tape:
-            predictions = self(inputs, training=True)
+            predictions = self(inputs, mask, training=True)
+            # mask padding tokens in targets
+            targets *= mask
             loss = self.loss_function(targets, predictions)
             
         gradients = tape.gradient(loss, self.trainable_variables)
@@ -438,9 +450,11 @@ class Transformer(tf.keras.Model):
 
         return loss
     
-    def predict(self, inputs, targets):
+    def predict(self, inputs, targets, mask):
         
-        predictions = self(inputs, training=False)
+        predictions = self(inputs, mask, training=False)
+        # mask padding tokens in targets
+        targets *= mask
         loss = self.loss_function(targets, predictions)
 
         return loss, predictions
@@ -502,9 +516,10 @@ num_heads = 8 # Number of parallel self attention heads in the MHA layer
 dropout_rate = 0.1
 
 # Data HP
-input_vocab_size = 364 # number of tokens of input, i.e. angles
+input_vocab_size = 363 # number of tokens of input, i.e. angles
 batch_size = max(con.shape[0] for con, x, t in dataset)
 MAX_SEQ_LEN = max(con.shape[1] for con, x, t in dataset)
+PAD = -362
 print(f"\nNumber of batches: {num_batches}, Batch size: {batch_size}, Maximum sequence length: {MAX_SEQ_LEN}\n")
 
 # Training HP
@@ -534,7 +549,7 @@ transformer = Transformer(num_layers, d_model, num_heads, dff, input_vocab_size,
 for con, x, target in train_ds.take(1):
     break
 
-output = transformer((con, x), training=False)
+output = transformer((con, x))
 
 transformer.compile(optimizer='adam', loss='mse', metrics=['accuracy'])
 #transformer.summary()
@@ -558,9 +573,10 @@ for epoch in range(EPOCHS):
 
     # Training loop
     for batch, (context, x, target) in enumerate(train_ds):
-        
+
         # Perform one training step and compute its loss
-        loss = transformer.train_step((context, x), target)
+        mask = compute_mask(target, padding_token=PAD)
+        loss = transformer.train_step((context, x), target, mask)
         loss_metric_train.update_state(values=loss)
 
     print(f"Train loss at epoch {epoch+1}: {loss_metric_train.result()}")
@@ -577,7 +593,8 @@ for epoch in range(EPOCHS):
     for batch, (context, x, target) in enumerate(test_ds):
 
         # Get prediction and calculate loss
-        loss, prediction_ = transformer.predict((context, x), target)
+        mask = compute_mask(target, padding_token=PAD)
+        loss, prediction_ = transformer.predict((context, x), target, mask)
         loss_metric_test.update_state(values=loss)
 
     # Append test accuracy and save the model
@@ -589,9 +606,6 @@ for epoch in range(EPOCHS):
         tf.summary.scalar(f"{loss_metric_test.name}", loss_metric_test.result(), step=epoch)
 
     print(f"Test loss at epoch {epoch+1}: {loss_metric_test.result()}")
-
-    if epoch % 100 == 0:
-        print(f"Epoch {epoch+1}/{EPOCHS}\nBatch {batch+1}/{test_size}\n\nTarget: {target.shape}\n{target}\n\nPrediction: {prediction_.shape}\n{prediction_}\n\n")
 
     # Early stopping
     if early_stopping(loss_metric_test.result()):
