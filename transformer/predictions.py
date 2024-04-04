@@ -29,7 +29,7 @@ transformer = load_model("model")
 # In[3]:
 
 # Define the file path where the zipped dataset was saved
-import_path = "./data/train_ds.zip"
+import_path = "./data/test_ds.zip"
 
 # Function to deserialize tensors from bytes
 def deserialize_example(serialized_example):
@@ -56,6 +56,7 @@ predictions = transformer.predict(test_ds)
 #print(f"Shape: {predictions.shape}, \nPredictions: \n{predictions}")
 print(f"Shape: {predictions.shape}")
 
+# surrogate predictions from train ds
 predictions_ds = test_ds.map(lambda train_data, label_data: (train_data, predictions))
 
 # Debugging: check dataset

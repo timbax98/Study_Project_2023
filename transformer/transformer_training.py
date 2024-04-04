@@ -1,3 +1,22 @@
+"""
+Transformer Model for Language Understanding
+
+This Python script contains an adaptation of the Transformer model for language understanding
+tutorial provided by TensorFlow. The original tutorial can be found at:
+https://www.tensorflow.org/text/tutorials/transformer
+
+Author: TensorFlow Authors
+Title: Neural machine translation with a Transformer and Keras
+Website: TensorFlow official website
+URL: https://www.tensorflow.org/text/tutorials/transformer
+Year: 2024-03-23 UTC
+
+The code in this script is adapted from the TensorFlow tutorial mentioned above.
+
+This script is distributed under the Creative Commons Attribution 4.0 License:
+https://creativecommons.org/licenses/by/4.0/
+"""
+
 # region Setup
 
 import os
@@ -23,14 +42,14 @@ def deserialize(serialized_example):
 
     feature_description = {
         'context': tf.io.FixedLenFeature([], tf.string),
-        'x': tf.io.FixedLenFeature([], tf.string),
+        'input': tf.io.FixedLenFeature([], tf.string),
         'target': tf.io.FixedLenFeature([], tf.string)
     }
 
     example = tf.io.parse_single_example(serialized_example, feature_description)
-    context = tf.io.parse_tensor(example['context'], out_type=tf.float32)
-    x = tf.io.parse_tensor(example['x'], out_type=tf.float32)
-    target = tf.io.parse_tensor(example['target'], out_type=tf.float32)
+    context = tf.io.parse_tensor(example['context'], out_type=tf.float64)
+    x = tf.io.parse_tensor(example['input'], out_type=tf.float64)
+    target = tf.io.parse_tensor(example['target'], out_type=tf.float64)
 
     return context, x, target
 
@@ -47,7 +66,8 @@ def save_weights(current_loss,epoch,transformer):
         shutil.rmtree("weights/transformer", ignore_errors=True)
 
         # Save current model
-        transformer.save("weights/transformer", save_format="tf")
+        #transformer.save("weights/transformer", save_format="tf")
+        tf.keras.models.save_model(transformer, "weights/transformer", save_format="tf")
         # tf.saved_model.save(transformer, export_dir="transformer")
         return "\nModel saved!"
 
@@ -77,7 +97,7 @@ def early_stopping(current_loss):
 
 
 def compute_mask(inputs, padding_token=0):
-    return tf.cast(tf.not_equal(inputs, padding_token), tf.float32)
+    return tf.cast(tf.not_equal(inputs, padding_token), tf.float64)
 
 
 def positional_encoding(length, depth):
@@ -154,9 +174,31 @@ def masked_accuracy(label, pred, pad_token=-2):
 
     match = match & mask
 
-    match = tf.cast(match, dtype=tf.float32)
-    mask = tf.cast(mask, dtype=tf.float32)
+    match = tf.cast(match, dtype=tf.float64)
+    mask = tf.cast(mask, dtype=tf.float64)
     return tf.reduce_sum(match)/tf.reduce_sum(mask)
+
+
+class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, d_model, warmup_steps=4000):
+        super().__init__()
+
+        self.d_model = d_model
+        self.d_model = tf.cast(self.d_model, tf.float64)
+        self.warmup_steps = warmup_steps
+
+    def __call__(self, step):
+        step = tf.cast(step, dtype=tf.float64)
+        arg1 = tf.math.rsqrt(step)
+        arg2 = step * (self.warmup_steps ** -1.5)
+
+        return tf.math.rsqrt(self.d_model) * tf.math.minimum(arg1, arg2)
+
+    def get_config(self):
+        return {
+            'd_model': self.d_model,
+            'warmup_steps': self.warmup_steps
+        }
 
 # endregion
     
@@ -417,7 +459,7 @@ class Transformer(tf.keras.Model):
         self.optimizer = tf.keras.optimizers.Adam()
 
     def call(self, inputs, mask=None, training=False):
-        
+
         context, x = inputs
 
         context = self.encoder(context, training, mask)
@@ -464,17 +506,20 @@ class Transformer(tf.keras.Model):
 # region Data
     
 # Import dataset from path
-import_path = "./data/mock_ds.zip"
+train_path = "./data/train_ds.zip"
+test_path = "./data/test_ds.zip"
 
 # Create a TFRecordDataset from the saved file and deserialize
-dataset = tf.data.TFRecordDataset(import_path, compression_type='GZIP')
-dataset = dataset.map(deserialize)
+train_ds = tf.data.TFRecordDataset(train_path, compression_type='GZIP')
+train_ds = train_ds.map(deserialize)
+test_ds = tf.data.TFRecordDataset(test_path, compression_type='GZIP')
+test_ds = test_ds.map(deserialize)
 
 # Debugging: check train dataset
 """
 samples_to_print = 1
 print(f"\n \n Printing {samples_to_print} samples")
-for batch, (con, x, target) in enumerate(dataset.take(samples_to_print)):
+for batch, (con, x, target) in enumerate(train_ds.take(samples_to_print)):
     if batch < 5: # print at most the first 5 examples
         print(f"Batch: {batch}")
         print("Context:")
@@ -492,15 +537,16 @@ for batch, (con, x, target) in enumerate(dataset.take(samples_to_print)):
 """
 
 # Split dataset into training and validation
-num_batches = 0
-for batch in dataset:
-    num_batches += 1
+num_batches_train = 0
+for batch in train_ds:
+    num_batches_train += 1
 
-train_size = int(0.8 * num_batches) # roughly 80% train split
-test_size = num_batches - train_size
+num_batches_test = 0
+for batch in test_ds:
+    num_batches_test += 1
 
-train_ds = dataset.take(train_size)
-test_ds = dataset.skip(train_size).take(test_size)
+#print(f"Train shape: {len(train_ds)}, \ntest shape: {len(test_ds)}")
+print(f"Train shape: {num_batches_train}, \ntest shape: {num_batches_test}")
 
 # endregion
 
@@ -517,15 +563,18 @@ dropout_rate = 0.1
 
 # Data HP
 input_vocab_size = 363 # number of tokens of input, i.e. angles
-batch_size = max(con.shape[0] for con, x, t in dataset)
-MAX_SEQ_LEN = max(con.shape[1] for con, x, t in dataset)
-PAD = -362
-print(f"\nNumber of batches: {num_batches}, Batch size: {batch_size}, Maximum sequence length: {MAX_SEQ_LEN}\n")
+batch_size = max(con.shape[0] for con, x, t in train_ds)
+max_train = max(con.shape[1] for con, x, t in train_ds)
+max_test = max(con.shape[1] for con, x, t in test_ds)
+MAX_SEQ_LEN = max(max_train, max_test)
+PAD = -2
+print(f"\nTrainDS: number of batches: {num_batches_train}, batch size: {batch_size}, maximum sequence length: {max_train}")
+print(f"\nTestDS: number of batches: {num_batches_test}, batch size: {batch_size}, maximum sequence length: {max_test}\n")
 
 # Training HP
 EPOCHS = 100
 PATIENCE = 100
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.001 # not used yet
 
 """
 # Debugging: PosEncoding visualization
@@ -551,13 +600,25 @@ for con, x, target in train_ds.take(1):
 
 output = transformer((con, x))
 
-transformer.compile(optimizer='adam', loss='mse', metrics=['accuracy'])
+# Setup optimizer with custom learning rate schedule
+learning_rate = CustomSchedule(d_model)
+
+optimizer = tf.keras.optimizers.Adam(learning_rate, beta_1=0.9, beta_2=0.98,
+                                     epsilon=1e-9)
+
+# Compile the model
+transformer.compile(
+    loss=masked_loss,
+    optimizer="adam", # does currently not use custom lr schedule
+    metrics=[masked_accuracy])
+
+#transformer.compile(optimizer='adam', loss='mse', metrics=['accuracy'])
 #transformer.summary()
 
 ### Model training
 
 # Logging
-config_name= f"epochs{EPOCHS}lr{LEARNING_RATE}p{PATIENCE}"
+config_name= f"epochs{EPOCHS}p{PATIENCE}"
 current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 train_log_path = f"logs/{config_name}/{current_time}/train"
 test_log_path = f"logs/{config_name}/{current_time}/test"
@@ -578,6 +639,7 @@ for epoch in range(EPOCHS):
         mask = compute_mask(target, padding_token=PAD)
         loss = transformer.train_step((context, x), target, mask)
         loss_metric_train.update_state(values=loss)
+        #print(f"Training... Epoch {epoch+1}, Batch {batch+1}/{num_batches_train}.")
 
     print(f"Train loss at epoch {epoch+1}: {loss_metric_train.result()}")
 

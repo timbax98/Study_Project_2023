@@ -163,6 +163,7 @@ def Center(videopath, bounding_boxes):
     x_dists = []
     y_dists = []
 
+    """
     for box_pos in bbs:
         if np.isnan(box_pos).any():
             # if all values were nan, then 0 would be the max, so the corrected video would be the original video
@@ -175,11 +176,17 @@ def Center(videopath, bounding_boxes):
             # calculate distances
             x_dists.append(abs(center_x-center_x_bb))
             y_dists.append(abs(center_y-center_y_bb))
+    """
+    # Instead keep the size after centering constant across videos
+    # For this use a padding based on maximally possible offset
+
+    # ??? What is the correct centered size? (width + width) or (width + width*2) ? 
+    # Double should be correct (offset in each direction is max half the videos size in that dimension)
 
     # 3. Center video
     video_centered = np.zeros((len(video),
-                              int(height + max(y_dists)*2),
-                              int(width + max(x_dists)*2),
+                              int(height + height), # ehemals variabel: int(height + max(y_dists)*2),
+                              int(width + width), # ehemals variabel: int(width + max(x_dists)*2),
                               3), dtype=int)
 
     # get coords for placement height and width
@@ -316,7 +323,7 @@ def check_overlap(bbox1, bbox2):
     return True
 
 
-def delete_overlap_rows(hands, targets, frameCount, buffer=5):
+def delete_overlap_rows(hands, targets, frameCount, buffer=3):
     # in bb_arrays [0,1,2,3,4,5] = [video, frame, xc_target, yc_target, bbw_target, bbh_target]
 
     # Convert coordinates to frame, x1,x2,y1,y2
@@ -712,27 +719,41 @@ with np.printoptions(threshold=sys.maxsize, suppress=True):
 
 # endregion
 
-# region Markers
+# region Tokenization
 
 # define tokens; has to be unusual in sequences (0 to max dim of video res) as well as labels (radiands: -2pi to 2pi)
 start_token = -333 # for seqs and labels
-end_token = -666 # for labels only (sequences do not need an end token, as they are all separated by start tokens)
-padding_token = -999 # for seqs only (labels are generated from padded sequences)
+end_token = -1 # for labels only (sequences do not need an end token, as they are all separated by start tokens)
+padding_token = -2 # for seqs only (labels are generated from padded sequences)
 
 # Slice data into single videos
 uniques = np.unique(input[:,0])
 sliced_seqs = []
 sliced_labels = []
-#vid_res = [] # save video center for resolution-dependent epsilon later
+
+video_width = 1920
+video_height = 1080
+
+context_SOS = np.array([video_width/2, video_height/2, video_width/10, video_height/5, video_width/2, -1, video_width/5, video_height/5])
+context_EOS = np.array([video_width/2, video_height/2, video_width/8, video_height/3, video_width/2, video_height/2, video_width/6, video_height/6])
+context_PAD = np.array([padding_token] * 8)
 
 for vid in uniques:
     # subset input per video and append to list in which each array is one video (sequence)
     subset = input[input[:,0] == vid,:]
-    # this is the target object detection center x and y, i.e. half of the video's resolution
-    #vid_res.append((subset[0,2], subset[0,3]))
-    # prepend start token to sequence
-    subset = np.vstack([np.full((1, subset.shape[1]), start_token), subset])
+
+    #slice off video and frame count
+    subset = subset[:,2:]
+
+    # add fake embedded start token to beginning of seq
+    subset = np.vstack((context_SOS, subset))
+
+    # add fake embedded end token to end of seq
+    subset = np.vstack((subset, context_EOS))
+
     sliced_seqs.append(subset)
+
+    
 
 # Debug
 """
@@ -746,141 +767,263 @@ for i in range(sets_to_print):
 
 # region Batching
 
-# create list that contains lists of size batch_size, each one containing single videos (sequences) as arrays
+# calculate batch size
 BATCH_SIZE = calculate_batch_size(len(folder)-videos_removed, MAX_BATCH_SIZE)
-seq_batches = [sliced_seqs[i:i+BATCH_SIZE] for i in range(0, len(sliced_seqs), BATCH_SIZE)]
 
 # endregion
 
 # region Padding
 
-# Pad sequences to the maximum sequence length within each batch
-padded_seq_batches = []
-for batch in seq_batches:
-    max_length = max(seq.shape[0] for seq in batch)
-    # [:,2:] slices the sequence to remove columns for video count and frame count
-    padded_batch = [tf.pad(seq[:,2:], paddings=[[max_length - seq.shape[0], 0], [0, 0]], mode="CONSTANT", constant_values=padding_token) for seq in batch]
-    padded_seq_batches.append(tf.stack(padded_batch))
+# store all lengths to but end token at last point in sequence
+real_sequence_lengths = [seq.shape[0] for seq in sliced_seqs]
+
+print(f"real_sequence_lengths: {real_sequence_lengths}")
+
+# find max length over all batches and sequences
+max_length = max(seq.shape[0] for seq in sliced_seqs)
+
+# Debugging
+"""
+for seq in sliced_seqs:
+    print(f"sliced_seq.shape: {seq.shape}")
+"""
+
+# pad each sequence to max
+padded_sequences = []
+for seq in sliced_seqs:
+    padded_seq = [tf.pad(seq, paddings=[[0, max_length - seq.shape[0]], [0, 0]], mode="CONSTANT", constant_values=padding_token)]
+    padded_sequences.append(tf.stack(padded_seq))
+
+# Slice of unnecessary axis 0 in (1,max_length,8): --> (max_length,8)
+padded_sequences = [tf.stack(np.squeeze(seq, axis=0)) for seq in padded_sequences]
 
 # Debug
 """
-batches_to_print = 1
-print("\n \n Printing {} Padded batches".format(batches_to_print))
-for i in range(batches_to_print):
-    print(padded_seq_batches[i])
+for seq in padded_sequences:
+    print(f"padded seq.shape: {seq.shape}")
+
+elements_to_print = 1
+print("\n \n Printing {} Elements".format(elements_to_print))
+for element_number in range(elements_to_print):
+    print(padded_sequences[element_number])
+
+print(f"max_length: {max_length}")
 """
 
 # endregion
 
 # region Labels
 
-padded_lbl_batches = []
-for batch in padded_seq_batches:
-    labels = []
+padded_lbl_sequences = []
 
-    for seq in batch:
-        seq = seq.numpy()
-        lbl = np.zeros((seq.shape[0], 1))
+seq_counter = 0
+for seq in padded_sequences:
+    seq_length = real_sequence_lengths[seq_counter]
+    seq = seq.numpy()
+    lbl = np.zeros((seq.shape[0], 1))
 
-        for row in range(lbl.shape[0]):
+    #print(f"seq.shape: {seq.shape}")
+    #print(f"lbl.shape: {lbl.shape}")
 
-            # sos tokens
-            if np.all(seq[row] == start_token):
-                lbl[row] = start_token
-                continue
+    for row in range(lbl.shape[0]):
+        # sos tokens
+        if np.all(np.array(seq[row])  == context_SOS):
+            lbl[row] = start_token
+            continue
 
-            # padding tokens
-            if np.all(seq[row] == padding_token):
-                lbl[row] = padding_token
-                continue
+        # padding tokens
+        if np.all(seq[row] == padding_token):
+            lbl[row] = padding_token
+            continue
 
-            # EOS token if hand overlaps with target (with a little wiggle room epsilon)
-            object_loc = np.array(seq[row, 0], seq[row, 1])
-            hand_loc = np.array(seq[row, 4], seq[row, 5])
+        # fixed tokens for last point in sequence
+        if row == seq_length:
+            lbl[row] = end_token
+            continue
 
-            # this implementation entails that after an EOS token, there do not necessarily have to follow EOS tokens until the end
-            # -> good or bad for training/ online application?
-            if np.linalg.norm(hand_loc - object_loc) < EPSILON or row+1 == len(seq):
-                lbl[row] = end_token
-                continue
+        # EOS token if hand overlaps with target (with a little wiggle room epsilon)
+        object_loc = np.array([seq[row, 0], seq[row, 1]])
+        hand_loc = np.array([seq[row, 4], seq[row, 5]])
 
-            # else neither start- nor end-token -> calculate angle
-            # Calculate the angle between the line passing through the centers of two subsequent hand bounding boxes and the positive x-axis
-            lbl[row] = np.arctan2(seq[row+1,5] - seq[row,5], seq[row+1,4] - seq[row,4]) 
+        # this implementation entails that after an EOS token, there do not necessarily have to follow EOS tokens until the end
+        # -> good or bad for training/ online application?
+        if np.linalg.norm(hand_loc - object_loc) < EPSILON or row+1 == len(seq):
+            lbl[row] = end_token
+            continue
 
-            #print(seq[row+1,5], seq[row,5],seq[row+1,4], seq[row+1,4])
-            #print(f"label_angle: {np.arctan2(seq[row+1,5] - seq[row,5], seq[row+1,4] - seq[row,4])}")
+        # else neither start- nor end-token -> calculate angle
+        # Calculate the angle between the line passing through the centers of two subsequent hand bounding boxes and the positive x-axis
+        # calculate angle in degrees, range (0,360)
+        lbl[row] = int((np.arctan2(seq[row+1,5] - seq[row,5], seq[row+1,4] - seq[row,4]) * 180 / np.pi) + 180)
 
-        labels.append(lbl)
+        #print(seq[row+1,5], seq[row,5],seq[row+1,4], seq[row+1,4])
+        #print(f"label_angle: {np.arctan2(seq[row+1,5] - seq[row,5], seq[row+1,4] - seq[row,4])}")
 
-    padded_lbl_batches.append(tf.stack(labels))
+    padded_lbl_sequences.append(tf.stack(lbl))
+
+    seq_counter += 1
+
+# Convert outer lists from list to tensor
+padded_lbl_sequences = tf.stack(padded_lbl_sequences)
+padded_input_sequences = tf.stack(padded_sequences)
 
 # Debugging: check padded sequences and corresponding labels
 """
 with np.printoptions(threshold=sys.maxsize, suppress=True):
-    print(padded_seq_batches)
+    print(padded_input_sequences)
     print()
-    print(padded_lbl_batches)
+    print(padded_lbl_sequences)
 """
 
 # endregion
 
 # region Dataset
+    
+# Convert outer lists from list to tensor
+padded_lbl_sequences = tf.stack(padded_lbl_sequences)
+padded_input_sequences = tf.stack(padded_sequences)
 
 # 1. Create dataset
+dataset = tf.data.Dataset.from_tensor_slices((padded_input_sequences, padded_lbl_sequences))
 
-# Define a generator function to yield each sequence batch
-def seq_generator():
-    for batch in padded_seq_batches:
-        yield batch
+print(f"BATCH_SIZE: {BATCH_SIZE}")
 
-# Define a generator function to yield each label batch
-def lbl_generator():
-    for batch in padded_lbl_batches:
-        yield batch
+# Create dataset of shape: (context, input), target
+# Function to create correct labels for forced teacher learning
 
-# Create a tf.data.Dataset from the generator
-X = tf.data.Dataset.from_generator(seq_generator, output_signature=tf.TensorSpec(shape=(BATCH_SIZE, None, 8), dtype=tf.float32))
-Y = tf.data.Dataset.from_generator(lbl_generator, output_signature=tf.TensorSpec(shape=(BATCH_SIZE, None, 1), dtype=tf.float32))
-train_ds = tf.data.Dataset.zip((X, Y))
+def create_context_input_target_structure(padded_input_sequence, padded_lbl_sequence):
+    """
+    print(f"padded_input_sequence: {padded_input_sequence}")
+    print(f"padded_lbl_sequence: {padded_lbl_sequence}")
+    print(f"padded_input_sequence shape: {tf.shape(padded_input_sequence)}")
+    print(f"padded_lbl_sequence shape: {tf.shape(padded_lbl_sequence)}")
+    """
+    # we have: (x,y)
+    # we want: ((x, y[:-1]), y[1:])
+    # but we need to consider the padding!
+    # --> instead of shortening to lose start and end token respectively, replace tokens with padding instead
+    # --> but for target, we need to shift the sequence
+    context = padded_input_sequence
+    # Input: replace end token with padding token
+    input = tf.where(padded_lbl_sequence==end_token, tf.constant(padding_token, dtype=tf.float64), padded_lbl_sequence)
 
-# Debugging: check train dataset
+    # Target: delete start token and add a padding token to the end to get constant sequence length
+    target = padded_lbl_sequence[1:] # delete start token
+
+    # get shape of single point in sequence that is to be replaced
+    element_shape = tf.shape(padded_lbl_sequence[0])
+    padding_to_add = tf.fill(element_shape, tf.constant(padding_token, dtype=tf.float64))
+
+    target = tf.concat([target, [padding_to_add]], axis=0)  # add padding token to end of sequence to keep the same length
+
+    #input_bb, label_angle = datapoint
+    new_datapoint = context, input, target   # old without padding considered: new_datapoint = (input_bb, label_angle[:-1]), label_angle[1:]
+
+    return new_datapoint
+
+dataset = dataset.map(create_context_input_target_structure)
+
 """
 samples_to_print = 1
+print("\n \n Printing {} dataset".format(samples_to_print)) #.take(samples_to_print)
+for i, (context_data, input_data, target_data) in enumerate(dataset):
+    print(f"Training pair: {i}")
+    print("Context Data:")
+    print(context_data.shape)
+    print(context_data.numpy())
+    print()
+    print("Input Data:")
+    print(input_data.shape)
+    print(input_data.numpy())
+    print()
+    print("Target Data:")
+    print(target_data.shape)
+    print(target_data.numpy())
+    print()
+"""
+
+dataset = dataset.batch(BATCH_SIZE)
+
+
+# Split dataset into train and test
+num_batches = 0
+for batch in dataset:
+    num_batches += 1
+
+print(f"num_batches in full dataset: {num_batches}")
+train_size = int(0.8 * num_batches) # roughly 80% train split
+test_size = num_batches - train_size
+
+dataset = dataset.shuffle(100)
+train_ds = dataset.take(train_size)
+test_ds = dataset.skip(train_size).take(test_size)
+
+
+# Debugging: check train dataset
+""""
+samples_to_print = 1
 print("\n \n Printing {} train_ds".format(samples_to_print))
-for i, (train_data, label_data) in enumerate(train_ds.take(samples_to_print)):
-    if i < 5: # print at most the first 5 examples
-        print(f"Training pair: {i}")
-        print("Train Data:")
-        print(train_data.shape)
-        print(train_data.numpy())
-        print()
-        print("Label Data:")
-        print(label_data.shape)
-        print(label_data.numpy())
-        print()
+for i, (context_data, input_data, target_data) in enumerate(train_ds.take(samples_to_print)):
+    print(f"Training pair: {i}")
+    print("Context Data:")
+    print(context_data.shape)
+    print(context_data.numpy())
+    print()
+    print("Input Data:")
+    print(input_data.shape)
+    print(input_data.numpy())
+    print()
+    print("Target Data:")
+    print(target_data.shape)
+    print(target_data.numpy())
+    print()
+
+
+# Debugging: check test dataset
+samples_to_print = 1
+print("\n \n Printing {} test_ds".format(samples_to_print))
+for i, (context_data, input_data, target_data) in enumerate(test_ds.take(samples_to_print)):
+    print(f"Training pair: {i}")
+    print("Context Data:")
+    print(context_data.shape)
+    print(context_data.numpy())
+    print()
+    print("Input Data:")
+    print(input_data.shape)
+    print(input_data.numpy())
+    print()
+    print("Target Data:")
+    print(target_data.shape)
+    print(target_data.numpy())
+    print()
 """
 
 
 # 2. Export dataset
 
 # Define a file path for saving the zipped dataset
-export_path = './data/train_ds.zip'
+export_paths = ['./data/train_ds.zip', './data/test_ds.zip']
 
-# Create a TFRecordWriter to save the zipped dataset
-options = tf.io.TFRecordOptions(compression_type='GZIP')
-with tf.io.TFRecordWriter(export_path, options=options) as writer:
-    for example_x, example_y in train_ds:
-        tf_example = tf.train.Example(features=tf.train.Features(
-            feature={
-                'x': tf.train.Feature(
-                    bytes_list=tf.train.BytesList(value=[tf.io.serialize_tensor(example_x).numpy()])
-                ),
-                'y': tf.train.Feature(
-                    bytes_list=tf.train.BytesList(value=[tf.io.serialize_tensor(example_y).numpy()])
-                )
-            }
-        ))
-        writer.write(tf_example.SerializeToString())
+for export_path in export_paths:
+    # Create a TFRecordWriter to save the zipped dataset
+    options = tf.io.TFRecordOptions(compression_type='GZIP')
+    with tf.io.TFRecordWriter(export_path, options=options) as writer:
+        ds = train_ds if export_path == export_paths[0] else test_ds
+        for context, input, target in ds:
+            tf_example = tf.train.Example(features=tf.train.Features(
+                feature={
+                    'context': tf.train.Feature(
+                        bytes_list=tf.train.BytesList(value=[tf.io.serialize_tensor(context).numpy()])
+                    ),
+                    'input': tf.train.Feature(
+                        bytes_list=tf.train.BytesList(value=[tf.io.serialize_tensor(input).numpy()])
+                    ),
+                    'target': tf.train.Feature(
+                        bytes_list=tf.train.BytesList(value=[tf.io.serialize_tensor(target).numpy()])
+                    )
+                }
+            ))
+            writer.write(tf_example.SerializeToString())
+
 
 # endregion
