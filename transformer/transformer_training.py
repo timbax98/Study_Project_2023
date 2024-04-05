@@ -66,9 +66,8 @@ def save_weights(current_loss,epoch,transformer):
         shutil.rmtree("weights/transformer", ignore_errors=True)
 
         # Save current model
-        #transformer.save("weights/transformer", save_format="tf")
-        tf.keras.models.save_model(transformer, "weights/transformer", save_format="tf")
-        # tf.saved_model.save(transformer, export_dir="transformer")
+        tf.keras.models.save_model(transformer, "models/transformer", save_format="tf") # easier export/import
+        #tf.saved_model.save(transformer, export_dir="transformer") # more flexibility and compatibility
         return "\nModel saved!"
 
     else:
@@ -572,7 +571,7 @@ print(f"\nTrainDS: number of batches: {num_batches_train}, batch size: {batch_si
 print(f"\nTestDS: number of batches: {num_batches_test}, batch size: {batch_size}, maximum sequence length: {max_test}\n")
 
 # Training HP
-EPOCHS = 100
+EPOCHS = 3000
 PATIENCE = 100
 LEARNING_RATE = 0.001 # not used yet
 
