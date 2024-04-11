@@ -28,7 +28,6 @@ import numpy as np
 import shutil
 import tensorflow as tf
 import datetime
-
 import zipfile
 
 # endregion
@@ -95,7 +94,7 @@ def early_stopping(current_loss):
       return False
 
 
-def compute_mask(inputs, padding_token=0):
+def compute_mask(inputs, padding_token=-2):
     return tf.cast(tf.not_equal(inputs, padding_token), tf.float64)
 
 
@@ -590,7 +589,7 @@ plt.colorbar()
 plt.show()
 """
 
-# Instantiate the Transformer model and print summary.
+# Instantiate the Transformer model
 transformer = Transformer(num_layers, d_model, num_heads, dff, input_vocab_size, dropout_rate)
 
 # Build the model using first batch
