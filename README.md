@@ -1,6 +1,6 @@
 # Study Project: Sensory augmentation and grasping movements
 
-This repository contains the study project on Sensory augmentation and grasping movements in SS23 & WS23/24. The project builds on the OptiVisT project, which focuses on supporting blind individuals in guiding their hand movements using a tactile bracelet and vibration motor inputs. In this study, we aim to enhance this concept by implementing a transformer neural network for hand movement guidance. Instead of simple left, right, up, and down commands from the bracelet, we translate naturalistic movement vectors into corresponding directional vibrations on an improved version of the tactile bracelet.
+This repository contains the study project on Sensory augmentation and grasping movements in SS23 & WS23/24 of the University of Osnabrück. The project builds on an OptiVisT subproject, which focuses on supporting blind individuals in guiding their hand movements using a tactile bracelet and vibration motor inputs. Here, we aim to enhance this concept by implementing a transformer neural network for hand movement guidance. Instead of simple left, right, up, and down commands from the bracelet, the transformer predicts naturalistic hand movement trajectories which are then translated into corresponding directional vibrations on an improved version of the tactile bracelet.
 
 ## Dependencies
 
@@ -8,86 +8,106 @@ The code relies on the following external libraries:
 
 - **cv2**: OpenCV library for video processing.
 - **numpy**: Numerical computing library for efficient array manipulation.
-- **ultralytics**: Ultralytics library for object detection (used to obtain bounding box information).
-- **pydrive**: Library for interfacing with Google Drive.
+- **yolov5**: Ultralytics library for object detection with YOLOv5.
 - **tensorflow**: An open-source machine learning framework.
-- **keras**: High-level neural networks API running on top of TensorFlow.
-- **Progbar**: Progress bar for tracking training iterations.
-- **TensorBoard**: TensorFlow's built-in tool for visualizing training metrics.
 
 Please ensure that these libraries are installed and available before running the code.
 
-## Notebooks
+## 1. Data creation
 
-### Video Centering
+The create_dataset.py script contains all functionality for creating input (training) data from raw videofiles for the transformer model.
 
-The 01-transformer-video_centering.ipynb notebook inlcudes a video centering functionality which allows you to create a new video where a target object is always centered. This is useful for ensuring that a specific object remains in the center of each frame throughout the video. The provided code takes a video file as input and applies centering transformations based on bounding box information.
+### Bounding Box extraction
 
-#### Function Signature
+The script includes code for extracting bounding box information from videos, performing interpolation to fill missing information, and concatenating the input data for each video. The following function extracts bounding boxes from a video using an object detector (YOLOv5 models, trained on COCO and EgoHands DS).
 
 ```python
-def Center(videopath, bounding_boxes, width, height, to_path):
+def GetBoundingBoxes(videopath, weightpath):
     ...
+    return bbs, classes, remove_vid
+```
+
+#### Parameters
+
+- `videopath`: The path to the input video file.
+- `weightpath`: The path to the YOLOv5 model weights for object detection.
+
+#### Returns
+
+- `bbs`: Extracted bounding box information.
+- `classes`: All class names that the model can detect.
+- `remove_vid`: Flag for removing videos of low data quality.
+
+#### Example Usage
+
+```python
+video_path = "input_video.mp4"
+weightpath = "hands.pt"
+
+bbs, classes, remove_vid = GetBoundingBoxes(videopath, weightpath)
+```
+
+#### Interpolation
+
+After extracting the bounding box information, the script performs simple linear interpolation to fill in missing information for frames where the object was not detected and removing videos that do not fulfill the data quality requirements, e.g. has too many missing frames.
+
+
+### Target Centering
+
+The script inlcudes a video centering functionality which allows you to create a new video where a target object is always centered. This is useful because it effectively filters out the head movement from the videos, leaving only the true hand trajectory. The provided code takes a video file as input and applies centering transformations based on bounding box information.
+
+```python
+def Center(videopath, bounding_boxes):
+    ...
+    return offsets, start_cords, video_centered
 ```
 
 #### Parameters
 
 - `videopath`: The path to the input video file.
 - `bounding_boxes`: A list of bounding boxes representing the target object in each frame of the video. Each bounding box should be a tuple of four values: `(x_min, y_min, x_max, y_max)`.
-- `width`: The desired width of the output video.
-- `height`: The desired height of the output video.
-- `to_path`: The path where the centered video should be saved.
+
+#### Returns
+
+- `offsets`: Values of new video dimensions - old video dimensions.
+- `start_cords`: Start coordinates tuple `(start_row, start_col)` of the centered video embedded into new video.
+- `video_centered`: The target-centered video (with black borders).
 
 #### Example Usage
 
 ```python
 video_path = "input_video.mp4"
 bounding_boxes = [(100, 100, 300, 300), (150, 150, 350, 350), ...]  # Bounding boxes for each frame
-width = 640
-height = 480
-output_path = "centered_video.mp4"
 
-Center(video_path, bounding_boxes, width, height, output_path)
+offsets, start_cords, video_centered = Center(video_path, bounding_boxes)
 ```
 
-The resulting video will have the target object consistently positioned at the center of each frame. Said videos are then saved, and the final bounding box information for the target and hand (post-centering) is stored in NPZ files and uploaded to Google Drive.
 
-### Data Creation
-The 02-transformer-data_creation.ipynb notebook focuses on generating and preprocessing the training data required for training the transformer neural network. It involves extracting bounding box information from videos, performing interpolation to fill missing information, and concatenating the input data for each video.
+### Visualization
 
-#### Function: `GetBoundingBoxes(videopath)`
+There are two additional functions `Export(video, targetBBs, handBBs, labelpath)` and `PlotTrajectory(path, name, input)`. The former enables saving of the labeled video with bounding boxes around hand and target object, and a vector indicating the next movement direction of the hand. The latter allows saving trajectory plots of single videos indicating the true movement trajectory of the hand towards the target.
 
-This function extracts bounding boxes from a video using an object tracker. It takes the video's path as input and returns a tuple containing bounding box information (`bbs`) and class names (`classes`).
 
-#### Function Signature
+## 2. Training
 
-```python
-def GetBoundingBoxes(videopath):
-    ...
-```
+The transformer_training.py script is dedicated to training the transformer model. The model solves a classification task of predicting an angle in [0, 360] (1°) that is the direction from the current hand position to the next hand position. 
 
-#### Parameters
+### Model architecture
 
-- `videopath`: The path to the input video file.
+The model architecture follows the original transformer model from ["Attention is all you need"](https://arxiv.org/abs/1706.03762) by Vaswani et al. (2017) stacking encoder and decoder modules that incorporate self attention layers. Its implementation is largely guided by following the TensorFlow tutorial [Neural machine translation with a Transformer and Keras](https://www.tensorflow.org/text/tutorials/transformer). 
 
-#### Video Processing Workflow
+![Transformer](https://www.tensorflow.org/images/tutorials/transformer/transformer.png)
 
-The script starts by loading a YOLO model (`yolov8n.pt`) and setting video folder paths. It iterates through each video in the specified folder, loading post-centering bounding boxes for hand and target objects. The script then creates an array (`vid_input`) with information for each frame, performing interpolation for both target and hand objects. The interpolated data is used to fill the `vid_input` array, which is then concatenated together (`input`). Rows with NaN values are removed for data cleanliness.
+However, our solution uses data-specific embeddings, i.e. no additional context embedding as bounding box data is inherently spatial data already (and 8D), and stacked sine-embeddings for our input data as it is of circular nature. Furthermore, we use a custom padding mask for masking out padding tokens during the training. Finally, the transformer outputs logits for each angle class that are fed trough a softmax layer for further use in the prediction script.
 
-#### Interpolation
-After extracting the bounding box information, the notebook performs interpolation to fill in missing information for frames where the object was not detected. The interpolation method currently used takes the last known information for the object.
+### Model Training
 
-### Training
-The 03-transformer-training.ipynb notebook is dedicated to training the transformer model. 
-
-#### Import Dataset
 - Deserialize the training dataset from a zipped file (`train_ds.zip`) using the TFRecord dataset.
-
-#### Build Model
 - Build a Transformer model with specified hyperparameters.
 - Compile the model using the Adam optimizer and Mean Squared Error loss function.
 
-#### Train Model
+#### Training Loop
+
 - Initialize logging and metrics for training and testing.
 - Execute the main training loop with epochs.
   - Train the model using the `train_step` method, updating the training loss metric.
@@ -97,42 +117,58 @@ The 03-transformer-training.ipynb notebook is dedicated to training the transfor
 - Save the trained model.
 
 #### Example Usage
+
 ```python
 # Define hyperparameters
 batch_size, max_sequence_length, num_layers, num_heads, dff, input_dim, output_dim, d_model = ...
 
-# Instantiate and train the Transformer model
-transformer = Transformer(num_layers, d_model, num_heads, dff, max_sequence_length, input_dim, output_dim)
-train_model(transformer, train_ds, test_ds, epochs=100, lr=0.001, patience=10)
+# Instantiate the Transformer model
+transformer = Transformer(num_layers, d_model, num_heads, dff, input_vocab_size, dropout_rate)
+
+# Build the model using first batch
+for con, x, target in train_ds.take(1):
+    break
+output = transformer((con, x))
+
+# Compile the model
+transformer.compile(
+    loss=masked_loss,
+    optimizer="adam",
+    metrics=[masked_accuracy])
+
+# Pseudo-function instead of train-test loop
+train_transformer(...)
 ```
 
-### Prediction
-The 04-transformer-prediction.ipynb notebook focuses on making predictions using the trained transformer model.
 
-#### Import Trained Model
+## 3. Prediction
+
+The predictions.py script focuses on making predictions using the trained transformer model.
+
+### Generate Predictions
+- Deserialize the test dataset from a zipped file (`test_ds.zip`) using the TFRecord dataset.
 - Load the pre-trained Transformer model using TensorFlow's `load_model` function.
-
-#### Generate Predictions
-- Generate dummy novel data with a specified input shape based on the training data.
-- Use the loaded model to obtain predictions for the input data.
+- Iterate through the DS: compute the padding mask, call the transformer and extract the highest probability prediction.
 
 #### Example Usage
+
 ```python
 import tensorflow as tf
-from tensorflow.keras.models import load_model
+
+# Load tensorflow dataset
+test_ds_path = "./data/test_ds.zip"
+test_dataset = tf.data.TFRecordDataset(test_ds_path, compression_type='GZIP')
+test_dataset = test_dataset.map(deserialize)
 
 # Import trained model
-transformer = load_model("transformer")
-
-# Generate predictions
-batches = 2
-batch_size = 3
-sequence_length = 126
-input_dim = 8
-input_data = tf.random.uniform((batch_size, sequence_length, input_dim))
+transformer = tf.keras.models.load_model("transformer")
 
 # Obtain predictions
-predictions = transformer.predict(input_data)
-print(f"Shape: {predictions.shape}, \nPredictions: \n{predictions}")
-```
+for batch, (context, x, target) in enumerate(test_dataset):
+        mask = compute_mask(target, padding_token=PAD)
+        logits = transformer((context, x), training=False, mask=mask)
+        predictions = tf.argmax(logits, axis=2)
 
+        print(f'{"Ground Truth"}: {target[1].numpy().flatten().tolist()}')
+        print(f'{"Prediction"}: {predictions[1].numpy().flatten().tolist()}')
+```

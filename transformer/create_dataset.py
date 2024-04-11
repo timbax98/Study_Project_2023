@@ -5,9 +5,8 @@ import sys
 import zipfile
 import cv2
 import numpy as np
-import ultralytics
-import tensorflow as tf
 import yolov5
+import tensorflow as tf
 import matplotlib.pyplot as plt
 
 # Configure Hyperparameters
@@ -38,6 +37,7 @@ def GetBoundingBoxes(videopath, weightpath):
 
     Args:
     videopath -- path to video to extract bounding boxes from.
+    weightpath -- path to object detector weights.
     """
 
     # Load model
@@ -133,8 +133,6 @@ def Center(videopath, bounding_boxes):
     Args:
     videopath -- path to video to center
     bounding_boxes -- bbs of object to center on
-    width -- output video dim x, default=1920
-    height -- output video dim y, default=1120
     """
 
     # 1. Read video
@@ -163,20 +161,6 @@ def Center(videopath, bounding_boxes):
     x_dists = []
     y_dists = []
 
-    """
-    for box_pos in bbs:
-        if np.isnan(box_pos).any():
-            # if all values were nan, then 0 would be the max, so the corrected video would be the original video
-            x_dists.append(0)
-            y_dists.append(0)
-        else:
-            # get center of bb
-            center_x_bb = box_pos[0]
-            center_y_bb = box_pos[1]
-            # calculate distances
-            x_dists.append(abs(center_x-center_x_bb))
-            y_dists.append(abs(center_y-center_y_bb))
-    """
     # Instead keep the size after centering constant across videos
     # For this use a padding based on maximally possible offset
 
