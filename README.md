@@ -143,7 +143,7 @@ train_transformer(...)
 
 ## 3. Prediction
 
-The predictions.py script focuses on making predictions using the trained transformer model.
+The predictions.ipynb notebook focuses on making predictions using the trained transformer model.
 
 ### <em>Generate Predictions</em>
 - Deserialize the test dataset from a zipped file (`test_ds.zip`) using the TFRecord dataset.
