@@ -17,7 +17,7 @@ Please ensure that these libraries are installed and available before running th
 
 The create_dataset.py script contains all functionality for creating input (training) data from raw videofiles for the transformer model.
 
-### Bounding Box extraction
+### <em>Bounding Box extraction</em>
 
 The script includes code for extracting bounding box information from videos, performing interpolation to fill missing information, and concatenating the input data for each video. The following function extracts bounding boxes from a video using an object detector (YOLOv5 models, trained on COCO and EgoHands DS).
 
@@ -52,7 +52,7 @@ bbs, classes, remove_vid = GetBoundingBoxes(videopath, weightpath)
 After extracting the bounding box information, the script performs simple linear interpolation to fill in missing information for frames where the object was not detected and removing videos that do not fulfill the data quality requirements, e.g. has too many missing frames.
 
 
-### Target Centering
+### <em>Target Centering</em>
 
 The script inlcudes a video centering functionality which allows you to create a new video where a target object is always centered. This is useful because it effectively filters out the head movement from the videos, leaving only the true hand trajectory. The provided code takes a video file as input and applies centering transformations based on bounding box information.
 
@@ -83,7 +83,7 @@ offsets, start_cords, video_centered = Center(video_path, bounding_boxes)
 ```
 
 
-### Visualization
+### <em>Visualization</em>
 
 There are two additional functions `Export(video, targetBBs, handBBs, labelpath)` and `PlotTrajectory(path, name, input)`. The former enables saving of the labeled video with bounding boxes around hand and target object, and a vector indicating the next movement direction of the hand. The latter allows saving trajectory plots of single videos indicating the true movement trajectory of the hand towards the target.
 
@@ -92,7 +92,7 @@ There are two additional functions `Export(video, targetBBs, handBBs, labelpath)
 
 The transformer_training.py script is dedicated to training the transformer model. The model solves a classification task of predicting an angle in [0, 360] (1°) that is the direction from the current hand position to the next hand position. 
 
-### Model architecture
+### <em>Model architecture</em>
 
 The model architecture follows the original transformer model from ["Attention is all you need"](https://arxiv.org/abs/1706.03762) by Vaswani et al. (2017) stacking encoder and decoder modules that incorporate self attention layers. Its implementation is largely guided by following the TensorFlow tutorial [Neural machine translation with a Transformer and Keras](https://www.tensorflow.org/text/tutorials/transformer). 
 
@@ -100,7 +100,7 @@ The model architecture follows the original transformer model from ["Attention i
 
 However, our solution uses data-specific embeddings, i.e. no additional context embedding as bounding box data is inherently spatial data already (and 8D), and stacked sine-embeddings for our input data as it is of circular nature. Furthermore, we use a custom padding mask for masking out padding tokens during the training. Finally, the transformer outputs logits for each angle class that are fed trough a softmax layer for further use in the prediction script.
 
-### Model Training
+### <em>Model Training</em>
 
 - Deserialize the training dataset from a zipped file (`train_ds.zip`) using the TFRecord dataset.
 - Build a Transformer model with specified hyperparameters.
@@ -145,7 +145,7 @@ train_transformer(...)
 
 The predictions.py script focuses on making predictions using the trained transformer model.
 
-### Generate Predictions
+### <em>Generate Predictions</em>
 - Deserialize the test dataset from a zipped file (`test_ds.zip`) using the TFRecord dataset.
 - Load the pre-trained Transformer model using TensorFlow's `load_model` function.
 - Iterate through the DS: compute the padding mask, call the transformer and extract the highest probability prediction.
