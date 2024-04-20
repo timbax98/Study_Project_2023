@@ -9,16 +9,15 @@ import yolov5
 import tensorflow as tf
 import matplotlib.pyplot as plt
 
-# Configure Hyperparameters
+# Configure Parameters for dataset creation
 MAX_BATCH_SIZE = 32 # maximum batch size of transformer training dataset
-EPSILON = 100 # pixel threshold for tokenizing the successful overlap of hand and target (EOS); which range?
-#EPSILON = vid_res[(batch+1)*(seq+1)][1] / 12  # alternative: use video resolution dependent epsilon
-MAX_MISSING = 10 # maximum length of missing detection sequence in a video, otherwise removed
-MIN_DETECTS = 1/4 # minimum number of frames in which object is detected, otherwise removed
-MIN_SCORE = 0.55 # minimum score threshold for evaluating true hand candidates in a video with multiple hand detections
-TRACKING_AREA = 100 # maximum distance for detecting hands after a true hand is lost; which range?
+OVERLAP_EPSILON = 100 # pixel threshold for tokenizing the successful overlap of hand and target (EOS)
+MAX_MISSING_DETEC_SEQ = 10 # maximum length of missing detection sequence in a video, otherwise removed
+MIN_DETECTS = 1/4 # minimum percentage of frames in which object is detected, otherwise removed
+MIN_SCORE_TRUE_HAND_BB = 0.55 # minimum score threshold for evaluating true hand candidates in a video with multiple hand detections
+TRACKING_DIST_BB = 100 # maximum distance for detecting hands after a true hand is lost
 
-# Create path variables
+# Create path variables for video data and YOLOv5 weights
 folderpath = './data/trials/'
 labelpath = './data/labels/'
 weights_objs = './weights/yolo/objects.pt'
@@ -38,11 +37,17 @@ def GetBoundingBoxes(videopath, weightpath):
     Args:
     videopath -- path to video to extract bounding boxes from.
     weightpath -- path to object detector weights.
+
+    Returns:
+    bbs -- numpy array with bounding box detections
+    classes -- list of detected classe in the given video
+    remove_vid -- boolean: True if there occured an error reading in a frame in the video, False otherwise
     """
 
-    # Load model
+    # Load YOLOv5 model
     model = yolov5.load(weightpath)
 
+    # Initialize bounding box data shapes for each frame
     bbs = np.zeros((0, 7))
     remove_vid = False
 
@@ -59,27 +64,28 @@ def GetBoundingBoxes(videopath, weightpath):
     for frame_num in range(frame_count):
         ret, frame = cap.read()
 
+        # If a frame cannot be read: remove the video from further consideration
         if not ret:
             remove_vid = True
             break
-
+        
+        # Change to RBG color space (standard color space in opencv is BGR) and call yolo on the current frame
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         result = model(frame)
-        #result.show()
 
-        # get object classes
+        # get detected object classes
         if frame_num == 0:
             classes = result.names
 
-        # (frame, class, x_center, y_center, bbwidth, bbheight, trackerID)
+        # shape of frame bounding box information: (frame, class, x_center, y_center, bbwidth, bbheight, trackerID)
         xywh = result.xywh[0].cpu().numpy()
-        n = len(xywh)
-        cls = xywh[:, 5].reshape((n,1))
+        num_detects_frame = len(xywh)
+        cls = xywh[:, 5].reshape((num_detects_frame,1))
         xywh = xywh[:, 0:4]
 
-        frame_count_n = np.repeat(frame_num, n).reshape((n,1))
+        frame_count_n = np.repeat(frame_num, num_detects_frame).reshape((num_detects_frame,1))
         data = np.concatenate((frame_count_n, cls, xywh), axis=1)
-        data = np.hstack((data, np.zeros((n, 1))))
+        data = np.hstack((data, np.zeros((num_detects_frame, 1))))
 
         # Filtering: Multiple hand detections per frame
         # do this only for hands, as only one hand should be detected (not using class filtering)
@@ -101,7 +107,7 @@ def GetBoundingBoxes(videopath, weightpath):
                         score = conf * ((ycenter - (bbheight//2)) / vidheight)
 
                         # search for true hand using the eval score (confidence weighted y-pos)
-                        if score >= MIN_SCORE and score > max_score:
+                        if score >= MIN_SCORE_TRUE_HAND_BB and score > max_score:
                             detection = d[0:4].reshape((1,4))
                             data = np.concatenate((np.array([[frame_num, 333]]), detection, np.array([[0]])), axis=1)
                             last_detection = detection
@@ -110,8 +116,8 @@ def GetBoundingBoxes(videopath, weightpath):
                 else:
                     distances = np.linalg.norm(detections[:, :4] - last_detection, axis=1)
 
-                    # tracking area avoids jumps to a wrong hand if the true hand is lost in a frame
-                    if min(np.abs(distances)) <= TRACKING_AREA:
+                    # Tracking distance check avoids jumps to a wrong hand if the true hand is lost in a frame
+                    if min(np.abs(distances)) <= TRACKING_DIST_BB:
                         closest_index = np.argmin(np.abs(distances))
                         detection = detections[closest_index, :4].reshape((1, 4))
                         data = np.concatenate((np.array([[frame_num, 333]]), detection, np.array([[0]])), axis=1)
@@ -540,7 +546,7 @@ for i, video in enumerate(folder):
         videos_removed += 1
         continue
 
-    if len(x_detects_target) < possible_detections * MIN_DETECTS or any(diff > MAX_MISSING for diff in differences):
+    if len(x_detects_target) < possible_detections * MIN_DETECTS or any(diff > MAX_MISSING_DETEC_SEQ for diff in differences):
         print("Video skipped because there are not enough detections or missing frame sequences are too long (objects).")
         #print(f"x_detects_target: {len(x_detects_target)}, possible detections: {possible_detections}, threshold: {possible_detections * MIN_DETECTS}")
         videos_removed += 1
@@ -601,7 +607,7 @@ for i, video in enumerate(folder):
         videos_removed += 1
         continue
 
-    if len(x_detects_hand) < possible_detections * MIN_DETECTS or any(diff > MAX_MISSING for diff in differences):
+    if len(x_detects_hand) < possible_detections * MIN_DETECTS or any(diff > MAX_MISSING_DETEC_SEQ for diff in differences):
         print("Video skipped because there are not enough detections or missing frame sequences are too long (hands).")
         #print(f"x_detects_target: {len(x_detects_hand)}, possible detections: {possible_detections}, threshold: {possible_detections * MIN_DETECTS}")
         videos_removed += 1
@@ -825,13 +831,13 @@ for seq in padded_sequences:
             lbl[row] = end_token
             continue
 
-        # EOS token if hand overlaps with target (with a little wiggle room epsilon)
+        # EOS token if hand overlaps with target (with a little wiggle room EPSILON)
         object_loc = np.array([seq[row, 0], seq[row, 1]])
         hand_loc = np.array([seq[row, 4], seq[row, 5]])
 
         # this implementation entails that after an EOS token, there do not necessarily have to follow EOS tokens until the end
         # -> good or bad for training/ online application?
-        if np.linalg.norm(hand_loc - object_loc) < EPSILON or row+1 == len(seq):
+        if np.linalg.norm(hand_loc - object_loc) < OVERLAP_EPSILON or row+1 == len(seq):
             lbl[row] = end_token
             continue
 
