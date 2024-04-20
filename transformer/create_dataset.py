@@ -10,12 +10,12 @@ import tensorflow as tf
 import matplotlib.pyplot as plt
 
 # Configure Parameters for dataset creation
-MAX_BATCH_SIZE = 32 # maximum batch size of transformer training dataset
-OVERLAP_EPSILON = 100 # pixel threshold for tokenizing the successful overlap of hand and target (EOS)
-MAX_MISSING_DETEC_SEQ = 10 # maximum length of missing detection sequence in a video, otherwise removed
-MIN_DETECTS = 1/4 # minimum percentage of frames in which object is detected, otherwise removed
-MIN_SCORE_TRUE_HAND_BB = 0.55 # minimum score threshold for evaluating true hand candidates in a video with multiple hand detections
-TRACKING_DIST_BB = 100 # maximum distance for detecting hands after a true hand is lost
+MAX_BATCH_SIZE = 32  # maximum batch size of transformer training dataset
+OVERLAP_EPSILON = 100  # pixel threshold for tokenizing the successful overlap of hand and target (EOS)
+MAX_MISSING_DETEC_SEQ = 10  # maximum length of missing detection sequence in a video, otherwise removed
+MIN_DETECTS = 1/4  # minimum percentage of frames in which object is detected, otherwise removed
+MIN_SCORE_TRUE_HAND_BB = 0.55  # minimum score threshold for evaluating true hand candidates in a video with multiple hand detections
+TRACKING_DIST_BB = 100  # maximum distance for detecting hands after a true hand is lost
 
 # Create path variables for video data and YOLOv5 weights
 folderpath = './data/trials/'
